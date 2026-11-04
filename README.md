@@ -1,4 +1,4 @@
-# Rykvo Voice SIP
+# SIP VPN
 
 Ubuntu 24.04 LTS · amd64 / arm64
 
