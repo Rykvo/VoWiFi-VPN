@@ -12,33 +12,54 @@ let toastTimer;
 let connectingClient = null;
 let connectionView = 0;
 let confirmResolve = null;
+let sessionView = 0;
 
 async function request(path, method = 'GET', body) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 40000);
-  try {
-    const response = await fetch(path, {
-      method,
-      signal: controller.signal,
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(csrf ? { 'X-CSRF-Token': csrf } : {})
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      if (response.status === 401 && path !== '/api/login') showLogin();
-      throw new Error(data.error || '操作失败，请重试。');
+  const view = sessionView;
+  const attempts = method === 'GET' ? 2 : 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), method === 'GET' ? 30000 : 40000);
+    try {
+      const response = await fetch(path, {
+        method,
+        signal: controller.signal,
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(csrf ? { 'X-CSRF-Token': csrf } : {})
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      });
+      if (response.status === 401 && path !== '/api/login' && view === sessionView) showLogin();
+      let data;
+      try { data = await response.json(); }
+      catch {
+        const error = new Error('服务器响应异常，请稍后重试。');
+        error.retryable = response.ok || [502, 503, 504].includes(response.status);
+        throw error;
+      }
+      if (!response.ok) {
+        const error = new Error(typeof data?.error === 'string' ? data.error : '操作失败，请重试。');
+        error.retryable = [502, 503, 504].includes(response.status);
+        throw error;
+      }
+      if (!data || typeof data !== 'object') throw new Error('服务器响应异常，请稍后重试。');
+      return data;
+    } catch (error) {
+      const transient = error.retryable || ['AbortError', 'TypeError'].includes(error.name);
+      if (transient && attempt + 1 < attempts && view === sessionView) {
+        clearTimeout(timeout);
+        await new Promise(resolve => setTimeout(resolve, 800));
+        if (view === sessionView) continue;
+      }
+      if (error.name === 'AbortError') throw new Error(method === 'GET' ? '读取超时，请重试。' : '请求超时，请刷新确认结果。');
+      if (error.name === 'TypeError') throw new Error('网络连接中断，请重试。');
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-    return data;
-  } catch (error) {
-    if (error.name === 'AbortError') throw new Error('请求超时，请刷新确认结果。');
-    if (error instanceof TypeError) throw new Error('网络连接中断，请重试。');
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -48,6 +69,8 @@ function globalError(message) {
 }
 
 function showLogin() {
+  sessionView++;
+  refreshTask = null;
   document.querySelectorAll('dialog[open]').forEach(dialog => dialog.close());
   $('boot-view').hidden = true;
   $('login-view').hidden = false;
@@ -119,38 +142,55 @@ async function showHelp(client) {
   $('help-title').textContent = `连接 ${client.name}`;
   $('connect-endpoint').value = `https://${current.settings.sipDomain || current.publicIp}/api/connect`;
   $('connect-token').value = '';
-  $('connect-token').placeholder = '加载中…';
+  $('connect-token').placeholder = '点击下方生成';
   $('copy-token').disabled = true;
   $('generate-token').disabled = true;
   $('generate-token').textContent = '生成接入码';
+  $('generate-token').removeAttribute('aria-busy');
+  $('retry-enrollment').hidden = true;
   $('connect-error').textContent = '';
   $('help-dialog').showModal();
+  await loadEnrollment(client.id, view);
+}
+
+async function loadEnrollment(clientId, view) {
+  $('retry-enrollment').hidden = true;
+  $('connect-error').textContent = '';
   try {
-    const result = await request(`/api/clients/${client.id}/enrollment`);
+    const result = await request(`/api/clients/${clientId}/enrollment`);
     if (view !== connectionView) return;
     renderEnrollment(result);
     $('generate-token').disabled = false;
   } catch (error) {
     if (view !== connectionView) return;
-    $('connect-token').placeholder = '';
     $('connect-error').textContent = error.message;
+    $('retry-enrollment').hidden = false;
   }
 }
 
 async function generateToken() {
   const clientId = connectingClient;
   const view = connectionView;
-  if (clientId === null) return;
+  if (clientId === null || $('generate-token').disabled) return;
   $('generate-token').disabled = true;
+  $('generate-token').setAttribute('aria-busy', 'true');
+  const label = $('generate-token').textContent;
+  $('generate-token').textContent = '生成中…';
   $('connect-error').textContent = '';
   try {
     const result = await request(`/api/clients/${clientId}/enrollment`, 'POST', {});
     if (view !== connectionView) return;
     renderEnrollment(result);
   } catch (error) {
-    if (view === connectionView) $('connect-error').textContent = error.message;
+    if (view === connectionView) {
+      $('connect-error').textContent = error.message;
+      $('generate-token').textContent = label;
+    }
   } finally {
-    if (view === connectionView) $('generate-token').disabled = false;
+    if (view === connectionView) {
+      $('generate-token').disabled = false;
+      $('generate-token').removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -292,11 +332,14 @@ function render(data) {
 
 function refresh() {
   if (refreshTask) return refreshTask;
-  refreshTask = request('/api/state').then(data => {
+  const view = sessionView;
+  const task = request('/api/state').then(data => {
+    if (view !== sessionView) return;
     render(data);
     globalError('');
-  }).finally(() => { refreshTask = null; });
-  return refreshTask;
+  }).finally(() => { if (refreshTask === task) refreshTask = null; });
+  refreshTask = task;
+  return task;
 }
 
 $('login-form').addEventListener('submit', async event => {
@@ -438,6 +481,9 @@ $('search').addEventListener('input', () => {
   renderClients();
 });
 $('generate-token').addEventListener('click', generateToken);
+$('retry-enrollment').addEventListener('click', () => {
+  if (connectingClient !== null) return loadEnrollment(connectingClient, connectionView);
+});
 $('copy-endpoint').addEventListener('click', () => copyField('connect-endpoint'));
 $('copy-token').addEventListener('click', () => copyField('connect-token'));
 $('help-dialog').addEventListener('close', () => {
@@ -475,6 +521,15 @@ async function loadPage() {
   }
 }
 $('boot-retry').addEventListener('click', loadPage);
+let lastResume = 0;
+function resumePage() {
+  if (document.hidden || Date.now() - lastResume < 3000) return;
+  lastResume = Date.now();
+  if (!$('app-view').hidden) refresh().catch(error => globalError(error.message));
+  else if (!$('boot-view').hidden) loadPage();
+}
+window.addEventListener('online', resumePage);
+document.addEventListener('visibilitychange', resumePage);
 loadPage();
 setInterval(() => {
   if (!$('app-view').hidden && !$('page-clients').hidden && !document.hidden

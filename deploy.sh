@@ -40,7 +40,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
-    https://codeload.github.com/Rykvo/Rykvo-Voice-SIP/tar.gz/refs/heads/main \
+    https://codeload.github.com/Rykvo/SIP-VPN/tar.gz/refs/heads/main \
     -o "$workspace/source.tar.gz" || {
       echo '下载失败，请检查网络及仓库是否已公开。'; return 1;
     }

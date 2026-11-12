@@ -1,4 +1,5 @@
 import importlib.util
+import contextlib
 import json
 from pathlib import Path
 import subprocess
@@ -75,7 +76,7 @@ class InstallerTests(unittest.TestCase):
             m.uninstall()
         compose.assert_called_once_with('down')
         rules.assert_called_once()
-        self.assertEqual(unlink.call_count, 6)
+        self.assertEqual(unlink.call_count, 8)
         delete.assert_called_once_with(Path('/opt/sip-tunnel'))
 
     def test_removes_only_owned_firewall_jumps(self):
@@ -95,7 +96,8 @@ class InstallerTests(unittest.TestCase):
         written = {}
         with patch.object(m, 'write', side_effect=lambda path, data, *args: written.update({str(path): data})):
             m.write_services()
-        self.assertEqual(len(written), 4)
+        self.assertEqual(len(written), 6)
+        self.assertIn('OnUnitInactiveSec=30', written['/etc/systemd/system/sip-watchdog.timer'])
         self.assertIn('ReadWritePaths=/opt/sip-tunnel', written['/etc/systemd/system/sip-simple-panel.service'])
         compose = (REPO / 'deploy/compose.yaml').read_text()
         self.assertIn('HOST: "127.0.0.1"', compose)
@@ -141,6 +143,91 @@ class InstallerTests(unittest.TestCase):
             config = next(call.args[1] for call in calls if call.args[0] == 'admin/userconfig' and len(call.args) == 2)
             self.assertEqual(config['defaultAllowedIps'], ['10.77.0.1/32'])
             self.assertEqual(config['defaultDns'], [])
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.panel = Mock()
+        self.panel.mutation.side_effect = contextlib.nullcontext
+        self.started = '2026-01-01T00:00:00Z'
+        self.healthy = True
+        self.commands = []
+        def fake_run(args, **kwargs):
+            self.commands.append(args)
+            if args[:2] == ['docker', 'inspect']:
+                return Mock(returncode=0, stdout='running ' + self.started)
+            if args[:2] == ['wg', 'show']:
+                return Mock(returncode=0 if self.healthy else 1, stdout='51820\n' if self.healthy else '')
+            return Mock(returncode=0, stdout='')
+        for item in [patch.object(m, 'ROOT', self.root), patch.object(m, 'run', side_effect=fake_run),
+                     patch.object(m, 'input_rules'), patch.object(m.time, 'time', return_value=1000)]:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def restarted(self):
+        return [args for args in self.commands if args[:2] == ['docker', 'restart']]
+
+    def test_healthy_tunnel_never_restarts_for_absent_client_handshakes(self):
+        for _ in range(5):
+            m.watchdog(self.panel)
+        self.assertFalse(self.restarted())
+        self.panel.apply_rules.assert_called_once()
+        self.assertIn(['systemctl', 'start', 'sip-wireguard', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'], self.commands)
+
+    def test_three_failures_restart_once_and_cooldown_prevents_a_loop(self):
+        self.healthy = False
+        for _ in range(2):
+            m.watchdog(self.panel)
+        self.assertFalse(self.restarted())
+        m.watchdog(self.panel)
+        self.assertEqual(len(self.restarted()), 1)
+        for _ in range(8):
+            m.watchdog(self.panel)
+        self.assertEqual(len(self.restarted()), 1)
+        with patch.object(m.time, 'time', return_value=1301):
+            m.watchdog(self.panel)
+        self.assertEqual(len(self.restarted()), 2)
+
+    def test_recovery_and_external_container_restart_restore_rules(self):
+        self.healthy = False
+        m.watchdog(self.panel)
+        self.healthy = True
+        m.watchdog(self.panel)
+        self.assertEqual(json.loads((self.root / 'watchdog.json').read_text())['failures'], 0)
+        self.started = '2026-01-01T01:00:00Z'
+        m.watchdog(self.panel)
+        self.assertEqual(self.panel.apply_rules.call_count, 2)
+        self.assertFalse(self.restarted())
+
+    def test_failed_rule_restore_is_retried_without_restarting_container(self):
+        self.panel.apply_rules.side_effect = RuntimeError('fixture firewall failure')
+        with self.assertRaises(RuntimeError):
+            m.watchdog(self.panel)
+        self.assertFalse((self.root / 'watchdog.json').exists())
+        self.panel.apply_rules.side_effect = None
+        m.watchdog(self.panel)
+        self.assertEqual(self.panel.apply_rules.call_count, 2)
+        self.assertFalse(self.restarted())
+
+    def test_docker_unavailable_does_not_issue_blind_restarts(self):
+        with patch.object(m, 'run', return_value=Mock(returncode=1)) as run:
+            with self.assertRaises(RuntimeError):
+                m.watchdog(self.panel)
+        self.assertEqual(run.call_count, 1)
+
+    def test_rules_wait_for_the_interface_to_be_ready(self):
+        with patch.object(m, 'run', side_effect=[Mock(returncode=1), Mock(returncode=0, stdout='51820\n')]), patch.object(m.time, 'sleep') as sleep:
+            m.wait_wireguard()
+        sleep.assert_called_once_with(1)
+
+    def test_missing_interface_has_a_bounded_startup_wait(self):
+        with patch.object(m, 'run', return_value=Mock(returncode=1)), patch.object(m.time, 'sleep') as sleep:
+            with self.assertRaises(RuntimeError):
+                m.wait_wireguard()
+        self.assertEqual(sleep.call_count, 30)
 
 
 if __name__ == '__main__':

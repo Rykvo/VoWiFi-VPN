@@ -413,6 +413,9 @@ def apply_rules(state):
         if any(x['ip'] == c['ip'] for x in seen):
             raise UserError('客户端隧道地址重复。')
         seen.append(c)
+    # Loose reverse-path filtering supports the tunnel's source-based routes.
+    if Path('/sys/class/net/wg0').exists():
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.wg0.rp_filter=2'])
     for table, chain in [('nat', 'SIPT_DNAT'), ('nat', 'SIPT_SNAT'), ('filter', 'SIPT_FORWARD')]:
         check = subprocess.run(['iptables','-w','10','-t',table,'-S',chain],capture_output=True)
         if check.returncode:

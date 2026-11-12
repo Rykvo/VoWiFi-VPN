@@ -4,7 +4,8 @@ html { height:100%; }
 body { margin:0; height:100vh; height:100dvh; overflow:hidden; background:radial-gradient(ellipse at top left,#f1ddd2 0,transparent 45%),radial-gradient(ellipse at bottom right,#c9d7e7 0,transparent 48%),#e8e9ed; padding:18px; -webkit-font-smoothing:antialiased }
 button, input { font:inherit }
 button { cursor:pointer }
-button:disabled { opacity:.55; cursor:wait }
+button:disabled { opacity:.55; cursor:not-allowed }
+button[aria-busy="true"] { cursor:wait }
 a { color:#007aff; text-decoration:none }
 svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; flex:none }
 .svg-defs { position:absolute; width:0; height:0; overflow:hidden }

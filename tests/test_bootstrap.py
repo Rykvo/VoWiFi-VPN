@@ -13,6 +13,11 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'deploy.sh'
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_download_uses_current_repository(self):
+        script = SCRIPT.read_text()
+        self.assertIn('https://codeload.github.com/Rykvo/SIP-VPN/tar.gz/refs/heads/main', script)
+        self.assertNotIn('Rykvo/Rykvo-Voice-SIP', script)
+
     def test_help_and_invalid_command(self):
         help_result = subprocess.run(['bash', str(SCRIPT), '--help'], capture_output=True, text=True)
         self.assertEqual(help_result.returncode, 0)

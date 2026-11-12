@@ -173,6 +173,12 @@ class DomainTests(unittest.TestCase):
    self.assertFalse(m.check_domain('missing.example.com',True)['ok'])
 
 class NetworkTests(unittest.TestCase):
+ def test_tunnel_uses_loose_reverse_path_filtering(self):
+  from unittest.mock import Mock
+  with patch.object(m.Path,'exists',return_value=True),patch.object(m.subprocess,'run',return_value=Mock(returncode=1)),patch.object(m,'run') as run:
+   m.apply_rules({'clients':[]})
+  run.assert_any_call(['sysctl','-q','-w','net.ipv4.conf.wg0.rp_filter=2'])
+
  def test_cloud_nat_and_detected_interface_are_used(self):
   from unittest.mock import Mock
   state={'clients':[{'name':'fixture','ip':'10.77.0.2','start':20000,'end':20999}]}

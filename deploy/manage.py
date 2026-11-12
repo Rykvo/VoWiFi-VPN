@@ -25,12 +25,13 @@ CLI = Path('/usr/local/bin/rykvo-sip')
 CLI_MARKER = '# Rykvo Voice SIP command'
 SOURCE_REPLACED = False
 SERVICES = ('sip-caddy', 'sip-simple-panel', 'sip-portmap', 'sip-wireguard')
+WATCHDOG_UNITS = ('sip-watchdog.timer', 'sip-watchdog.service')
 CHAINS = {'nat': ('SIPT_DNAT', 'SIPT_SNAT'), 'filter': ('SIPT_FORWARD', 'SIPT_INPUT')}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def run(args, *, check=True, capture=True):
-    return subprocess.run(args, check=check, text=True, capture_output=capture, timeout=900)
+def run(args, *, check=True, capture=True, timeout=900):
+    return subprocess.run(args, check=check, text=True, capture_output=capture, timeout=timeout)
 
 
 def write(path, value, mode=0o600):
@@ -101,6 +102,9 @@ def preflight():
     for service in SERVICES:
         if Path(f'/etc/systemd/system/{service}.service').exists():
             raise ValueError(f'{service} 已存在，已停止以保护现有服务。')
+    for unit in WATCHDOG_UNITS:
+        if Path(f'/etc/systemd/system/{unit}').exists():
+            raise ValueError(f'{unit} 已存在，已停止以保护现有服务。')
     print('环境检查通过。')
 
 
@@ -253,8 +257,59 @@ def write_services():
     }
     for name, (dependencies, service) in definitions.items():
         write(Path(f'/etc/systemd/system/{name}.service'),
-              f'[Unit]\nDescription=Rykvo Voice SIP - {name}\nWants=network-online.target\n{dependencies}\n'
+              f'[Unit]\nDescription=VoWiFi VPN - {name}\nWants=network-online.target\n{dependencies}\n'
               f'[Service]\n{service}\n[Install]\nWantedBy=multi-user.target\n', 0o644)
+    write(Path('/etc/systemd/system/sip-watchdog.service'),
+          '[Unit]\nDescription=VoWiFi VPN tunnel recovery\nAfter=docker.service\n'
+          '[Service]\nType=oneshot\nEnvironmentFile=/opt/sip-tunnel/runtime.env\n'
+          'ExecStart=/usr/bin/python3 -B /opt/sip-tunnel/manager.py watchdog\nTimeoutStartSec=90\n', 0o644)
+    write(Path('/etc/systemd/system/sip-watchdog.timer'),
+          '[Unit]\nDescription=VoWiFi VPN tunnel checks\n'
+          '[Timer]\nOnBootSec=90\nOnUnitInactiveSec=30\nAccuracySec=5\n'
+          '[Install]\nWantedBy=timers.target\n', 0o644)
+
+
+def watchdog(panel):
+    # Missing client handshakes are never a reason to restart the shared tunnel.
+    status = run(['docker', 'inspect', '--format', '{{.State.Status}} {{.State.StartedAt}}',
+                  'sip-wg-easy'], check=False, timeout=10)
+    if status.returncode:
+        raise RuntimeError('无法检查隧道容器，请检查 Docker 服务。')
+    container_status, started = status.stdout.strip().split(maxsplit=1)
+    interface = run(['wg', 'show', 'wg0', 'listen-port'], check=False, timeout=10)
+    healthy = container_status == 'running' and interface.returncode == 0 and interface.stdout.strip() == '51820'
+    path = ROOT / 'watchdog.json'
+    now = time.time()
+    with panel.mutation():
+        health = json.loads(path.read_text()) if path.exists() else {'failures': 0, 'lastRestart': 0}
+        if healthy:
+            # Restore project rules after Docker recreates the interface/container.
+            if health.get('started') != started or health['failures']:
+                panel.apply_rules(panel.load_state())
+                input_rules()
+            health.update(failures=0, started=started)
+        else:
+            health['failures'] += 1
+        recover = not healthy and health['failures'] >= 3 and now - health['lastRestart'] >= 300
+        if recover:
+            health.update(failures=0, lastRestart=now)
+            health.pop('started', None)
+        write(path, health)
+    if healthy:
+        # Requires=docker stops dependents when Docker goes away; start them again.
+        run(['systemctl', 'start', 'sip-wireguard', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'], timeout=45)
+    if recover:
+        print('隧道接口连续异常，正在恢复容器。', flush=True)
+        run(['docker', 'restart', 'sip-wg-easy'], timeout=45)
+
+
+def wait_wireguard():
+    for attempt in range(30):
+        interface = run(['wg', 'show', 'wg0', 'listen-port'], check=False, timeout=5)
+        if interface.returncode == 0 and interface.stdout.strip() == '51820':
+            return
+        time.sleep(1)
+    raise RuntimeError('WireGuard 隧道接口尚未就绪，请检查容器日志。')
 
 
 def install():
@@ -274,6 +329,7 @@ def install():
     write(ROOT / 'runtime.env', 'SIP_ROOT=/opt/sip-tunnel\n' + ''.join(f'{key}={value}\n' for key, value in state['network'].items()))
     write(ROOT / 'compose.yaml', (SOURCE / 'deploy/compose.yaml').read_text())
     compose('pull')
+    run(['systemctl', 'stop', *WATCHDOG_UNITS], check=False)
     install_source()
     shutil.copyfile(__file__, ROOT / 'manager.py')
     (ROOT / 'manager.py').chmod(0o600)
@@ -299,7 +355,9 @@ def install():
     write_services()
     run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', *SERVICES])
-    run(['systemctl', 'restart', 'sip-wireguard', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'])
+    run(['systemctl', 'start', 'sip-wireguard'])
+    run(['systemctl', 'restart', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'])
+    run(['systemctl', 'enable', '--now', 'sip-watchdog.timer'])
     for attempt in range(30):
         try:
             with OPENER.open('http://127.0.0.1:51822/gly', timeout=3) as response:
@@ -334,12 +392,14 @@ def uninstall():
     if input('将完整删除本项目程序、配置、账号、密钥、证书、客户端数据和备份。输入 DELETE 确认: ') != 'DELETE':
         print('已取消。')
         return
-    run(['systemctl', 'disable', '--now', *SERVICES], check=False)
+    run(['systemctl', 'disable', '--now', *WATCHDOG_UNITS, *SERVICES], check=False)
     if (ROOT / 'compose.yaml').exists():
         compose('down')
     remove_rules()
     for service in SERVICES:
         Path(f'/etc/systemd/system/{service}.service').unlink(missing_ok=True)
+    for unit in WATCHDOG_UNITS:
+        Path(f'/etc/systemd/system/{unit}').unlink(missing_ok=True)
     for name in ['/etc/sysctl.d/90-rykvo-sip.conf', '/etc/modules-load.d/rykvo-sip.conf']:
         Path(name).unlink(missing_ok=True)
     other_containers = run(['docker', 'ps', '-q']).stdout.strip()
@@ -375,11 +435,16 @@ def main():
                 backup.rename(ROOT/'app')
                 if was_active:
                     run(['systemctl','start','sip-simple-panel'],check=False)
+            run(['systemctl','start','sip-watchdog.timer'],check=False)
             raise
-    elif command == 'rules':
+    elif command in ('rules', 'watchdog'):
         state = read_marker()
         os.environ.update(state['network'], SIP_ROOT=str(ROOT))
         panel = panel_module()
+        if command == 'watchdog':
+            watchdog(panel)
+            return
+        wait_wireguard()
         with panel.mutation():
             panel.apply_rules(panel.load_state())
             input_rules()
