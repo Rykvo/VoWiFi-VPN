@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-ROOT = Path(os.environ.get('SIP_ROOT', '/opt/sip-tunnel'))
+ROOT = Path(os.environ.get('SIP_ROOT', '/opt/vowifi-vpn'))
 WEB = Path(__file__).resolve().parent / 'web'
 STATE = ROOT / 'clients.json'
 SETTINGS = ROOT / 'settings.json'
@@ -489,7 +489,7 @@ PersistentKeepalive = 25
 '''
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'SIPPanel'
+    server_version = 'VoWiFiVPN'
     def setup(self):
         super().setup()
         self.connection.settimeout(15)

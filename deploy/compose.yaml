@@ -1,8 +1,8 @@
-name: sip-tunnel
+name: vowifi-vpn
 services:
   wg-easy:
     image: ghcr.io/wg-easy/wg-easy:15.4.0
-    container_name: sip-wg-easy
+    container_name: vowifi-vpn-wg-easy
     network_mode: host
     environment:
       HOST: "127.0.0.1"

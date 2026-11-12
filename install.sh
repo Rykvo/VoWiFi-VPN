@@ -12,6 +12,11 @@ python3 -B deploy/manage.py preflight
 [[ ${1:-} != --check ]] || exit 0
 [[ $# == 0 ]] || { echo '未知参数。'; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
+dependency_prefix=vowifi
+# Reuse package source files on an existing installation to avoid duplicate APT entries.
+if [[ -f /opt/sip-tunnel/.rykvo-managed.json ]]; then
+  dependency_prefix=rykvo
+fi
 apt-get update
 apt-get install -y ca-certificates curl gnupg iproute2 iptables kmod python3 wireguard-tools
 if ! command -v docker >/dev/null; then
@@ -21,16 +26,16 @@ if ! command -v docker >/dev/null; then
   # Supported releases are checked before adding repositories.
   source /etc/os-release
   printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
-    "$(dpkg --print-architecture)" "$VERSION_CODENAME" > /etc/apt/sources.list.d/rykvo-docker.list
+    "$(dpkg --print-architecture)" "$VERSION_CODENAME" > "/etc/apt/sources.list.d/$dependency_prefix-docker.list"
   apt-get update
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 docker compose version >/dev/null || { echo '请安装 Docker Compose v2 插件后重试。'; exit 1; }
 if ! command -v caddy >/dev/null; then
-  curl -fsSL --retry 3 https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/rykvo-caddy.gpg
+  curl -fsSL --retry 3 https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o "/usr/share/keyrings/$dependency_prefix-caddy.gpg"
   curl -fsSL --retry 3 https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt |
-    sed 's@/usr/share/keyrings/caddy-stable-archive-keyring.gpg@/usr/share/keyrings/rykvo-caddy.gpg@g' > /etc/apt/sources.list.d/rykvo-caddy.list
-  chmod 0644 /usr/share/keyrings/rykvo-caddy.gpg
+    sed "s@/usr/share/keyrings/caddy-stable-archive-keyring.gpg@/usr/share/keyrings/$dependency_prefix-caddy.gpg@g" > "/etc/apt/sources.list.d/$dependency_prefix-caddy.list"
+  chmod 0644 "/usr/share/keyrings/$dependency_prefix-caddy.gpg"
   apt-get update
   apt-get install -y caddy
   systemctl disable --now caddy

@@ -15,13 +15,14 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'deploy.sh'
 class BootstrapTests(unittest.TestCase):
     def test_download_uses_current_repository(self):
         script = SCRIPT.read_text()
-        self.assertIn('https://codeload.github.com/Rykvo/SIP-VPN/tar.gz/refs/heads/main', script)
+        self.assertIn('https://codeload.github.com/Rykvo/VoWiFi-VPN/tar.gz/refs/heads/main', script)
+        self.assertNotIn('Rykvo/SIP-VPN', script)
         self.assertNotIn('Rykvo/Rykvo-Voice-SIP', script)
 
     def test_help_and_invalid_command(self):
         help_result = subprocess.run(['bash', str(SCRIPT), '--help'], capture_output=True, text=True)
         self.assertEqual(help_result.returncode, 0)
-        self.assertIn('rykvo-sip', help_result.stdout)
+        self.assertIn('vowifi-vpn', help_result.stdout)
         result = subprocess.run(['bash', str(SCRIPT), 'unknown'], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
@@ -53,7 +54,7 @@ class BootstrapTests(unittest.TestCase):
                 f'printf "\\nTTY_OK\\n"\nexit {exit_code}\n')
             archive = root / 'fixture.tar.gz'
             with tarfile.open(archive, 'w:gz') as bundle:
-                bundle.add(source, arcname='Rykvo-Voice-SIP-main')
+                bundle.add(source, arcname='VoWiFi-VPN-main')
             binary = root / 'bin'
             binary.mkdir()
             curl = binary / 'curl'

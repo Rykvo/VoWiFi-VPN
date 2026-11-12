@@ -61,7 +61,7 @@ class InstallerTests(unittest.TestCase):
             delete.assert_not_called()
 
     def test_uninstall_deletes_all_project_data_by_default(self):
-        with patch.object(m, 'ROOT', Path('/opt/sip-tunnel')), \
+        with patch.object(m, 'ROOT', Path('/opt/vowifi-vpn')), \
              patch.object(m, 'read_marker', return_value={'sysctl': {}}), \
              patch('builtins.input', return_value='DELETE'), \
              patch.object(m, 'run', return_value=Mock(stdout='', returncode=0)), \
@@ -70,14 +70,14 @@ class InstallerTests(unittest.TestCase):
              patch.object(Path, 'exists', return_value=True), \
              patch.object(Path, 'is_file', return_value=False), \
              patch.object(Path, 'is_symlink', return_value=False), \
-             patch.object(Path, 'resolve', return_value=Path('/opt/sip-tunnel')), \
+             patch.object(Path, 'resolve', return_value=Path('/opt/vowifi-vpn')), \
              patch.object(Path, 'unlink') as unlink, \
              patch.object(m.shutil, 'rmtree') as delete:
             m.uninstall()
         compose.assert_called_once_with('down')
         rules.assert_called_once()
         self.assertEqual(unlink.call_count, 8)
-        delete.assert_called_once_with(Path('/opt/sip-tunnel'))
+        delete.assert_called_once_with(Path('/opt/vowifi-vpn'))
 
     def test_removes_only_owned_firewall_jumps(self):
         calls = []
@@ -97,8 +97,8 @@ class InstallerTests(unittest.TestCase):
         with patch.object(m, 'write', side_effect=lambda path, data, *args: written.update({str(path): data})):
             m.write_services()
         self.assertEqual(len(written), 6)
-        self.assertIn('OnUnitInactiveSec=30', written['/etc/systemd/system/sip-watchdog.timer'])
-        self.assertIn('ReadWritePaths=/opt/sip-tunnel', written['/etc/systemd/system/sip-simple-panel.service'])
+        self.assertIn('OnUnitInactiveSec=30', written['/etc/systemd/system/vowifi-vpn-watchdog.timer'])
+        self.assertIn('ReadWritePaths=/opt/vowifi-vpn', written['/etc/systemd/system/vowifi-vpn-panel.service'])
         compose = (REPO / 'deploy/compose.yaml').read_text()
         self.assertIn('HOST: "127.0.0.1"', compose)
         self.assertNotIn('latest', compose)
@@ -145,6 +145,145 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(config['defaultDns'], [])
 
 
+class RebrandingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.current = self.root / 'vowifi-vpn'
+        self.legacy = self.root / 'sip-tunnel'
+        for name, value in [('DEFAULT_ROOT', self.current), ('LEGACY_ROOT', self.legacy)]:
+            item = patch.object(m, name, value)
+            item.start()
+            self.addCleanup(item.stop)
+
+    def marker(self, root, legacy=False, project=None):
+        root.mkdir(parents=True, exist_ok=True)
+        marker = root / (m.LEGACY_MARKER if legacy else '.vowifi-managed.json')
+        marker.write_text(json.dumps({'project': project or ('Rykvo-Voice-SIP' if legacy else 'VoWiFi-VPN'),
+                                      'version': 1, 'initialized': True}))
+        return marker
+
+    def test_new_installation_uses_new_directory_and_names(self):
+        self.assertEqual(m.installation_root(), self.current)
+        self.marker(self.current)
+        self.assertEqual(m.installation_root(), self.current)
+        with patch.object(m, 'ROOT', self.current):
+            self.assertEqual(m.runtime_name('vowifi-vpn-panel'), 'vowifi-vpn-panel')
+
+    def test_legacy_installation_keeps_its_directory_and_accepts_both_markers(self):
+        marker = self.marker(self.legacy, legacy=True)
+        data = self.legacy / 'clients.json'
+        data.write_text('{"clients":[{"id":11}]}')
+        self.assertEqual(m.installation_root(), self.legacy)
+        with patch.object(m, 'ROOT', self.legacy), patch.object(m, 'MARKER', marker):
+            self.assertEqual(m.read_marker()['project'], 'Rykvo-Voice-SIP')
+            marker.write_text(json.dumps({'project':'VoWiFi-VPN','version':1,'initialized':True}))
+            self.assertEqual(m.read_marker()['project'], 'VoWiFi-VPN')
+        self.assertEqual(data.read_text(), '{"clients":[{"id":11}]}')
+
+    def test_two_managed_installations_are_never_silently_combined(self):
+        self.marker(self.current)
+        self.marker(self.legacy, legacy=True)
+        with self.assertRaisesRegex(ValueError, '两套安装'):
+            m.installation_root()
+
+    def test_legacy_service_files_keep_original_paths_and_dependencies(self):
+        written = {}
+        with patch.object(m, 'ROOT', self.legacy), patch.object(m, 'write', side_effect=lambda path, data, *args: written.update({str(path):data})):
+            m.write_services()
+            compose = m.runtime_name((REPO / 'deploy/compose.yaml').read_text())
+        self.assertIn('name: sip-tunnel', compose)
+        self.assertIn('container_name: sip-wg-easy', compose)
+        panel = written['/etc/systemd/system/sip-simple-panel.service']
+        self.assertIn('Requires=sip-portmap.service', panel)
+        self.assertIn(f'ReadWritePaths={self.legacy}', panel)
+        self.assertIn('Description=VoWiFi VPN', panel)
+        self.assertNotIn('/opt/vowifi-vpn', ''.join(written.values()))
+        self.assertIn('/etc/systemd/system/sip-watchdog.timer', written)
+
+    def test_runtime_commands_use_existing_container_without_renaming_new_cli(self):
+        with patch.object(m, 'ROOT', self.legacy), patch.object(m.subprocess, 'run') as run:
+            m.run(['docker','restart','vowifi-vpn-wg-easy'])
+            run.assert_called_once_with(['docker','restart','sip-wg-easy'],check=True,text=True,capture_output=True,timeout=900)
+            self.assertEqual(m.runtime_name('/usr/local/bin/vowifi-vpn'), '/usr/local/bin/vowifi-vpn')
+
+    def test_new_command_and_owned_old_alias_are_both_updated(self):
+        current = self.root / 'bin/vowifi-vpn'
+        legacy = self.root / 'bin/rykvo-sip'
+        legacy.parent.mkdir()
+        legacy.write_text('# Rykvo Voice SIP command\nold')
+        with patch.object(m, 'CLI', current), patch.object(m, 'LEGACY_CLI', legacy):
+            m.install_commands()
+        self.assertIn('# VoWiFi VPN command', current.read_text())
+        self.assertEqual(current.read_bytes(), legacy.read_bytes())
+        self.assertEqual(current.stat().st_mode & 0o777, 0o755)
+
+    def test_unrelated_old_command_is_not_overwritten(self):
+        current = self.root / 'bin/vowifi-vpn'
+        legacy = self.root / 'bin/rykvo-sip'
+        legacy.parent.mkdir()
+        legacy.write_text('# unrelated application')
+        with patch.object(m, 'CLI', current), patch.object(m, 'LEGACY_CLI', legacy):
+            m.install_commands()
+        self.assertEqual(legacy.read_text(), '# unrelated application')
+        self.assertTrue(current.is_file())
+
+    def test_unrelated_marker_is_rejected(self):
+        marker = self.marker(self.legacy, legacy=True, project='another-app')
+        with patch.object(m, 'ROOT', self.legacy), patch.object(m, 'MARKER', marker):
+            with self.assertRaisesRegex(ValueError, '标记不匹配'):
+                m.read_marker()
+
+    def test_legacy_update_preserves_credentials_clients_and_container_identity(self):
+        marker = self.marker(self.legacy, legacy=True)
+        state = json.loads(marker.read_text())
+        state.update(network={'SIP_PUBLIC_IP':'8.8.8.8','SIP_BIND_IP':'10.0.0.5','SIP_PUBLIC_IF':'ens3'}, sysctl={})
+        marker.write_text(json.dumps(state))
+        preserved = {
+            'panel-admin.json':'{"username":"existing-admin","password":"fixture"}',
+            'admin-credentials.json':'{"username":"rykvo-service","password":"fixture"}',
+            'clients.json':'{"clients":[{"id":11}]}',
+            'enrollments.json':'{"11":{"hash":"fixture"}}',
+        }
+        for name, content in preserved.items():
+            (self.legacy / name).write_text(content)
+        panel = Mock(PUBLIC_IP='8.8.8.8', ADMIN=self.legacy / 'panel-admin.json')
+        panel.load_settings.return_value = {'panelDomain':'','sipDomain':''}
+        panel.caddy_config.return_value = '# fixture Caddyfile\n'
+        panel.UserError = RuntimeError
+        new_cli = self.legacy / 'bin/vowifi-vpn'
+        old_cli = self.legacy / 'bin/rykvo-sip'
+        old_cli.parent.mkdir()
+        old_cli.write_text(m.LEGACY_CLI_MARKER)
+        written = {}
+        original_write = m.write
+        def safe_write(path, data, mode=0o600):
+            if path.is_relative_to(self.legacy):
+                original_write(path, data, mode)
+            else:
+                written[str(path)] = data
+        response = Mock()
+        response.__enter__ = Mock(return_value=Mock(status=200))
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(m, 'ROOT', self.legacy), patch.object(m, 'MARKER', marker), \
+             patch.object(m, 'CLI', new_cli), patch.object(m, 'LEGACY_CLI', old_cli), \
+             patch.object(m, 'write', side_effect=safe_write), patch.object(m, 'run'), \
+             patch.object(m, 'compose') as compose, patch.object(m, 'install_source'), \
+             patch.object(m, 'panel_module', return_value=panel), \
+             patch.object(m.OPENER, 'open', return_value=response), patch.dict(m.os.environ, {}, clear=False):
+            m.install()
+        for name, content in preserved.items():
+            self.assertEqual((self.legacy / name).read_text(), content)
+        self.assertEqual(json.loads(marker.read_text())['project'], 'VoWiFi-VPN')
+        self.assertIn('container_name: sip-wg-easy', (self.legacy / 'compose.yaml').read_text())
+        self.assertIn(f'SIP_ROOT={self.legacy}', (self.legacy / 'runtime.env').read_text())
+        self.assertIn('/etc/systemd/system/sip-simple-panel.service', written)
+        self.assertEqual(new_cli.read_bytes(), old_cli.read_bytes())
+        compose.assert_any_call('up', '-d')
+        self.assertNotIn('INIT_PASSWORD', (self.legacy / 'compose.yaml').read_text())
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -175,7 +314,7 @@ class RecoveryTests(unittest.TestCase):
             m.watchdog(self.panel)
         self.assertFalse(self.restarted())
         self.panel.apply_rules.assert_called_once()
-        self.assertIn(['systemctl', 'start', 'sip-wireguard', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'], self.commands)
+        self.assertIn(['systemctl', 'start', 'vowifi-vpn-wireguard', 'vowifi-vpn-portmap', 'vowifi-vpn-panel', 'vowifi-vpn-caddy'], self.commands)
 
     def test_three_failures_restart_once_and_cooldown_prevents_a_loop(self):
         self.healthy = False

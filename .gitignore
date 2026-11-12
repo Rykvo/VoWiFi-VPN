@@ -4,6 +4,7 @@ __pycache__/
 .env
 runtime.env
 bootstrap.env
+.vowifi-managed.json
 .rykvo-managed.json
 bootstrap.yaml
 wg*.conf

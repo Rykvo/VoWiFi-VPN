@@ -19,19 +19,71 @@ import urllib.error
 import urllib.request
 
 SOURCE = Path(__file__).resolve().parents[1]
-ROOT = Path('/opt/sip-tunnel')
-MARKER = ROOT / '.rykvo-managed.json'
-CLI = Path('/usr/local/bin/rykvo-sip')
-CLI_MARKER = '# Rykvo Voice SIP command'
+DEFAULT_ROOT = Path('/opt/vowifi-vpn')
+LEGACY_ROOT = Path('/opt/sip-tunnel')
+LEGACY_PROJECT = 'Rykvo-Voice-SIP'
+LEGACY_MARKER = '.rykvo-managed.json'
+
+
+def installation_root():
+    current = DEFAULT_ROOT / '.vowifi-managed.json'
+    legacy = LEGACY_ROOT / LEGACY_MARKER
+    if current.is_file() and legacy.is_file():
+        raise ValueError('发现两套安装，请先核对实例；不会自动合并数据。')
+    return LEGACY_ROOT if legacy.is_file() else DEFAULT_ROOT
+
+
+ROOT = installation_root()
+MARKER = ROOT / (LEGACY_MARKER if ROOT == LEGACY_ROOT else '.vowifi-managed.json')
+CLI = Path('/usr/local/bin/vowifi-vpn')
+CLI_MARKER = '# VoWiFi VPN command'
+LEGACY_CLI = Path('/usr/local/bin/rykvo-sip')
+LEGACY_CLI_MARKER = '# Rykvo Voice SIP command'
 SOURCE_REPLACED = False
-SERVICES = ('sip-caddy', 'sip-simple-panel', 'sip-portmap', 'sip-wireguard')
-WATCHDOG_UNITS = ('sip-watchdog.timer', 'sip-watchdog.service')
+SERVICES = ('vowifi-vpn-caddy', 'vowifi-vpn-panel', 'vowifi-vpn-portmap', 'vowifi-vpn-wireguard')
+WATCHDOG_UNITS = ('vowifi-vpn-watchdog.timer', 'vowifi-vpn-watchdog.service')
 CHAINS = {'nat': ('SIPT_DNAT', 'SIPT_SNAT'), 'filter': ('SIPT_FORWARD', 'SIPT_INPUT')}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def runtime_name(value):
+    """Keep existing runtime identities so rebranding never recreates a live VPN."""
+    if ROOT != LEGACY_ROOT:
+        return value
+    replacements = {
+        '/opt/vowifi-vpn': str(LEGACY_ROOT),
+        'vowifi-vpn-wg-easy': 'sip-wg-easy',
+        'vowifi-vpn-panel': 'sip-simple-panel',
+        'vowifi-vpn-wireguard': 'sip-wireguard',
+        'vowifi-vpn-portmap': 'sip-portmap',
+        'vowifi-vpn-caddy': 'sip-caddy',
+        'vowifi-vpn-watchdog': 'sip-watchdog',
+        'name: vowifi-vpn': 'name: sip-tunnel',
+        '90-vowifi-vpn.conf': '90-rykvo-sip.conf',
+        'modules-load.d/vowifi-vpn.conf': 'modules-load.d/rykvo-sip.conf',
+    }
+    for current, legacy in replacements.items():
+        value = value.replace(current, legacy)
+    return value
+
+
+def owned_cli(path):
+    return path.is_file() and not path.is_symlink() and any(
+        marker in path.read_text() for marker in (CLI_MARKER, LEGACY_CLI_MARKER))
+
+
+def install_commands():
+    script = (SOURCE / 'deploy.sh').read_text()
+    # Do not overwrite an unrelated command that happens to use an old name.
+    update_alias = owned_cli(LEGACY_CLI)
+    write(CLI, script, 0o755)
+    if update_alias:
+        write(LEGACY_CLI, script, 0o755)
+
+
 def run(args, *, check=True, capture=True, timeout=900):
-    return subprocess.run(args, check=check, text=True, capture_output=capture, timeout=timeout)
+    return subprocess.run([runtime_name(arg) if isinstance(arg, str) else arg for arg in args],
+                          check=check, text=True, capture_output=capture, timeout=timeout)
 
 
 def write(path, value, mode=0o600):
@@ -49,12 +101,12 @@ def write(path, value, mode=0o600):
 
 
 def read_marker():
-    if ROOT.is_symlink() or ROOT.resolve() != Path('/opt/sip-tunnel'):
+    if ROOT.is_symlink() or ROOT.resolve() not in (DEFAULT_ROOT, LEGACY_ROOT):
         raise ValueError('安装目录路径异常。')
     if not MARKER.is_file():
         raise ValueError('未发现本项目安装标记；现有目录保持不变。')
     value = json.loads(MARKER.read_text())
-    if value.get('project') != 'Rykvo-Voice-SIP' or value.get('version') != 1:
+    if value.get('project') not in ('VoWiFi-VPN', LEGACY_PROJECT) or value.get('version') != 1:
         raise ValueError('安装标记不匹配。')
     return value
 
@@ -79,8 +131,8 @@ def preflight():
         raise ValueError('需要 amd64/arm64、systemd 和支持 WireGuard 的云主机。')
     if ROOT.is_symlink():
         raise ValueError('安装目录是符号链接，已停止。')
-    if CLI.is_symlink() or (CLI.exists() and CLI_MARKER not in CLI.read_text()):
-        raise ValueError('rykvo-sip 命令已被其他程序占用。')
+    if CLI.is_symlink() or (CLI.exists() and not owned_cli(CLI)):
+        raise ValueError('vowifi-vpn 命令已被其他程序占用。')
     if MARKER.exists():
         read_marker()
         print('环境检查通过，将保留已有数据。')
@@ -97,13 +149,13 @@ def preflight():
                 raise ValueError(f'端口 {port} 已占用；现有业务保持不变。') from error
     if Path('/sys/class/net/wg0').exists():
         raise ValueError('wg0 已存在，选择没有其他 WireGuard 业务的主机。')
-    if shutil.which('docker') and run(['docker', 'container', 'inspect', 'sip-wg-easy'], check=False).returncode == 0:
-        raise ValueError('sip-wg-easy 容器已存在，已停止以保护现有数据。')
+    if shutil.which('docker') and run(['docker', 'container', 'inspect', 'vowifi-vpn-wg-easy'], check=False).returncode == 0:
+        raise ValueError('vowifi-vpn-wg-easy 容器已存在，已停止以保护现有数据。')
     for service in SERVICES:
-        if Path(f'/etc/systemd/system/{service}.service').exists():
+        if Path(runtime_name(f'/etc/systemd/system/{service}.service')).exists():
             raise ValueError(f'{service} 已存在，已停止以保护现有服务。')
     for unit in WATCHDOG_UNITS:
-        if Path(f'/etc/systemd/system/{unit}').exists():
+        if Path(runtime_name(f'/etc/systemd/system/{unit}')).exists():
             raise ValueError(f'{unit} 已存在，已停止以保护现有服务。')
     print('环境检查通过。')
 
@@ -129,7 +181,7 @@ def detect_network():
 
 
 def panel_module(path=None):
-    spec = importlib.util.spec_from_file_location('rykvo_panel', path or ROOT / 'app/server.py')
+    spec = importlib.util.spec_from_file_location('vowifi_panel', path or ROOT / 'app/server.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -158,7 +210,7 @@ def install_source():
     shutil.copytree(SOURCE / 'app', stage, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for path in stage.rglob('*'):
         path.chmod(0o700 if path.is_dir() else 0o600)
-    run(['systemctl', 'stop', 'sip-simple-panel'], check=False)
+    run(['systemctl', 'stop', 'vowifi-vpn-panel'], check=False)
     old = ROOT / 'app'
     backup = ROOT / 'backups/app-rollback'
     if old.exists():
@@ -183,7 +235,7 @@ def input_rules():
 def initialize_wireguard(panel):
     credentials = ROOT / 'admin-credentials.json'
     if not credentials.exists():
-        write(credentials, {'username': 'rykvo-service', 'password': secrets.token_urlsafe(32)})
+        write(credentials, {'username': 'vowifi-service', 'password': secrets.token_urlsafe(32)})
     account = json.loads(credentials.read_text())
     write(ROOT / 'bootstrap.env', '\n'.join([
         'INIT_ENABLED=true', 'INIT_USERNAME=' + account['username'], 'INIT_PASSWORD=' + account['password'],
@@ -210,7 +262,7 @@ def initialize_wireguard(panel):
              ('filter', ['FORWARD', '-i', 'wg0', '-j', 'ACCEPT']),
              ('filter', ['FORWARD', '-o', 'wg0', '-j', 'ACCEPT'])]
     for table, rule in rules:
-        prefix = ['docker', 'exec', 'sip-wg-easy', 'iptables', '-w', '10', '-t', table]
+        prefix = ['docker', 'exec', 'vowifi-vpn-wg-easy', 'iptables', '-w', '10', '-t', table]
         while run(prefix + ['-C'] + rule, check=False).returncode == 0:
             run(prefix + ['-D'] + rule)
     compose('up', '-d', '--force-recreate')
@@ -235,35 +287,35 @@ def administrator(panel):
 
 def write_services():
     common = ('Restart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nProtectSystem=strict\n'
-              'ProtectHome=true\nPrivateTmp=true\nUMask=0077\nReadWritePaths=/opt/sip-tunnel\n')
+              'ProtectHome=true\nPrivateTmp=true\nUMask=0077\nReadWritePaths=/opt/vowifi-vpn\n')
     definitions = {
-        'sip-wireguard': ('After=network-online.target docker.service\nRequires=docker.service\n',
-                         'Type=oneshot\nRemainAfterExit=yes\nWorkingDirectory=/opt/sip-tunnel\n'
+        'vowifi-vpn-wireguard': ('After=network-online.target docker.service\nRequires=docker.service\n',
+                         'Type=oneshot\nRemainAfterExit=yes\nWorkingDirectory=/opt/vowifi-vpn\n'
                          'ExecStart=/usr/bin/docker compose up -d\nExecStop=/usr/bin/docker compose down\n'),
-        'sip-portmap': ('After=sip-wireguard.service\nRequires=sip-wireguard.service\n',
-                        'Type=oneshot\nRemainAfterExit=yes\nEnvironmentFile=/opt/sip-tunnel/runtime.env\n'
+        'vowifi-vpn-portmap': ('After=vowifi-vpn-wireguard.service\nRequires=vowifi-vpn-wireguard.service\n',
+                        'Type=oneshot\nRemainAfterExit=yes\nEnvironmentFile=/opt/vowifi-vpn/runtime.env\n'
                         'Environment=PYTHONDONTWRITEBYTECODE=1\n'
-                        'ExecStart=/usr/bin/python3 -B /opt/sip-tunnel/manager.py rules\n'),
-        'sip-simple-panel': ('After=sip-portmap.service\nRequires=sip-portmap.service\n',
-                             'EnvironmentFile=/opt/sip-tunnel/runtime.env\nEnvironment=PYTHONDONTWRITEBYTECODE=1\n'
-                             'ExecStart=/usr/bin/python3 -B /opt/sip-tunnel/app/server.py\n'
+                        'ExecStart=/usr/bin/python3 -B /opt/vowifi-vpn/manager.py rules\n'),
+        'vowifi-vpn-panel': ('After=vowifi-vpn-portmap.service\nRequires=vowifi-vpn-portmap.service\n',
+                             'EnvironmentFile=/opt/vowifi-vpn/runtime.env\nEnvironment=PYTHONDONTWRITEBYTECODE=1\n'
+                             'ExecStart=/usr/bin/python3 -B /opt/vowifi-vpn/app/server.py\n'
                              'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n' + common),
-        'sip-caddy': ('After=sip-simple-panel.service\nRequires=sip-simple-panel.service\n',
-                     'Environment=XDG_DATA_HOME=/opt/sip-tunnel/caddy-data\n'
-                     'Environment=XDG_CONFIG_HOME=/opt/sip-tunnel/caddy-config\n'
-                     'ExecStart=/usr/bin/caddy run --config /opt/sip-tunnel/Caddyfile\n'
-                     'ExecReload=/usr/bin/caddy reload --config /opt/sip-tunnel/Caddyfile\n'
+        'vowifi-vpn-caddy': ('After=vowifi-vpn-panel.service\nRequires=vowifi-vpn-panel.service\n',
+                     'Environment=XDG_DATA_HOME=/opt/vowifi-vpn/caddy-data\n'
+                     'Environment=XDG_CONFIG_HOME=/opt/vowifi-vpn/caddy-config\n'
+                     'ExecStart=/usr/bin/caddy run --config /opt/vowifi-vpn/Caddyfile\n'
+                     'ExecReload=/usr/bin/caddy reload --config /opt/vowifi-vpn/Caddyfile\n'
                      'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n' + common),
     }
     for name, (dependencies, service) in definitions.items():
-        write(Path(f'/etc/systemd/system/{name}.service'),
-              f'[Unit]\nDescription=VoWiFi VPN - {name}\nWants=network-online.target\n{dependencies}\n'
-              f'[Service]\n{service}\n[Install]\nWantedBy=multi-user.target\n', 0o644)
-    write(Path('/etc/systemd/system/sip-watchdog.service'),
-          '[Unit]\nDescription=VoWiFi VPN tunnel recovery\nAfter=docker.service\n'
-          '[Service]\nType=oneshot\nEnvironmentFile=/opt/sip-tunnel/runtime.env\n'
-          'ExecStart=/usr/bin/python3 -B /opt/sip-tunnel/manager.py watchdog\nTimeoutStartSec=90\n', 0o644)
-    write(Path('/etc/systemd/system/sip-watchdog.timer'),
+        write(Path(runtime_name(f'/etc/systemd/system/{name}.service')),
+              runtime_name(f'[Unit]\nDescription=VoWiFi VPN - {name}\nWants=network-online.target\n{dependencies}\n'
+              f'[Service]\n{service}\n[Install]\nWantedBy=multi-user.target\n'), 0o644)
+    write(Path(runtime_name('/etc/systemd/system/vowifi-vpn-watchdog.service')),
+          runtime_name('[Unit]\nDescription=VoWiFi VPN tunnel recovery\nAfter=docker.service\n'
+          '[Service]\nType=oneshot\nEnvironmentFile=/opt/vowifi-vpn/runtime.env\n'
+          'ExecStart=/usr/bin/python3 -B /opt/vowifi-vpn/manager.py watchdog\nTimeoutStartSec=90\n'), 0o644)
+    write(Path(runtime_name('/etc/systemd/system/vowifi-vpn-watchdog.timer')),
           '[Unit]\nDescription=VoWiFi VPN tunnel checks\n'
           '[Timer]\nOnBootSec=90\nOnUnitInactiveSec=30\nAccuracySec=5\n'
           '[Install]\nWantedBy=timers.target\n', 0o644)
@@ -272,7 +324,7 @@ def write_services():
 def watchdog(panel):
     # Missing client handshakes are never a reason to restart the shared tunnel.
     status = run(['docker', 'inspect', '--format', '{{.State.Status}} {{.State.StartedAt}}',
-                  'sip-wg-easy'], check=False, timeout=10)
+                  'vowifi-vpn-wg-easy'], check=False, timeout=10)
     if status.returncode:
         raise RuntimeError('无法检查隧道容器，请检查 Docker 服务。')
     container_status, started = status.stdout.strip().split(maxsplit=1)
@@ -297,10 +349,10 @@ def watchdog(panel):
         write(path, health)
     if healthy:
         # Requires=docker stops dependents when Docker goes away; start them again.
-        run(['systemctl', 'start', 'sip-wireguard', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'], timeout=45)
+        run(['systemctl', 'start', 'vowifi-vpn-wireguard', 'vowifi-vpn-portmap', 'vowifi-vpn-panel', 'vowifi-vpn-caddy'], timeout=45)
     if recover:
         print('隧道接口连续异常，正在恢复容器。', flush=True)
-        run(['docker', 'restart', 'sip-wg-easy'], timeout=45)
+        run(['docker', 'restart', 'vowifi-vpn-wg-easy'], timeout=45)
 
 
 def wait_wireguard():
@@ -318,16 +370,18 @@ def install():
     else:
         network = detect_network()
         ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-        state = {'project': 'Rykvo-Voice-SIP', 'version': 1, 'network': network, 'initialized': False,
+        state = {'project': 'VoWiFi-VPN', 'version': 1, 'network': network, 'initialized': False,
                  'sysctl': {key: run(['sysctl', '-n', key]).stdout.strip()
                             for key in ('net.ipv4.ip_forward', 'net.ipv4.conf.all.src_valid_mark')}}
         write(MARKER, state)
+    state['project'] = 'VoWiFi-VPN'
+    write(MARKER, state)
     ROOT.chmod(0o700)
     for directory in ('data', 'backups', 'caddy-data', 'caddy-config'):
         (ROOT / directory).mkdir(mode=0o700, exist_ok=True)
     os.environ.update(state['network'], SIP_ROOT=str(ROOT))
-    write(ROOT / 'runtime.env', 'SIP_ROOT=/opt/sip-tunnel\n' + ''.join(f'{key}={value}\n' for key, value in state['network'].items()))
-    write(ROOT / 'compose.yaml', (SOURCE / 'deploy/compose.yaml').read_text())
+    write(ROOT / 'runtime.env', f'SIP_ROOT={ROOT}\n' + ''.join(f'{key}={value}\n' for key, value in state['network'].items()))
+    write(ROOT / 'compose.yaml', runtime_name((SOURCE / 'deploy/compose.yaml').read_text()))
     compose('pull')
     run(['systemctl', 'stop', *WATCHDOG_UNITS], check=False)
     install_source()
@@ -338,9 +392,9 @@ def install():
                         ('enrollments.json', {}), ('panel-sessions.json', {})]:
         if not (ROOT / name).exists():
             write(ROOT / name, value)
-    write(Path('/etc/sysctl.d/90-rykvo-sip.conf'), 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.src_valid_mark=1\n', 0o644)
-    write(Path('/etc/modules-load.d/rykvo-sip.conf'), 'wireguard\n', 0o644)
-    run(['sysctl', '-p', '/etc/sysctl.d/90-rykvo-sip.conf'])
+    write(Path(runtime_name('/etc/sysctl.d/90-vowifi-vpn.conf')), 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.src_valid_mark=1\n', 0o644)
+    write(Path(runtime_name('/etc/modules-load.d/vowifi-vpn.conf')), 'wireguard\n', 0o644)
+    run(['sysctl', '-p', '/etc/sysctl.d/90-vowifi-vpn.conf'])
     input_rules()
     if not state['initialized']:
         initialize_wireguard(panel)
@@ -355,9 +409,9 @@ def install():
     write_services()
     run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', *SERVICES])
-    run(['systemctl', 'start', 'sip-wireguard'])
-    run(['systemctl', 'restart', 'sip-portmap', 'sip-simple-panel', 'sip-caddy'])
-    run(['systemctl', 'enable', '--now', 'sip-watchdog.timer'])
+    run(['systemctl', 'start', 'vowifi-vpn-wireguard'])
+    run(['systemctl', 'restart', 'vowifi-vpn-portmap', 'vowifi-vpn-panel', 'vowifi-vpn-caddy'])
+    run(['systemctl', 'enable', '--now', 'vowifi-vpn-watchdog.timer'])
     for attempt in range(30):
         try:
             with OPENER.open('http://127.0.0.1:51822/gly', timeout=3) as response:
@@ -369,7 +423,7 @@ def install():
                 raise RuntimeError('服务启动检查未通过，请检查 systemd 日志。')
             time.sleep(2)
     run(['systemctl', 'is-active', *SERVICES], capture=False)
-    write(CLI, (SOURCE / 'deploy.sh').read_text(), 0o755)
+    install_commands()
     print(f'部署完成：https://{settings["panelDomain"] or panel.PUBLIC_IP}/gly')
     print('HTTPS 证书自动申请；请确保云防火墙已开放 TCP 80/443、UDP 51820 和客户端端口段。')
 
@@ -397,11 +451,11 @@ def uninstall():
         compose('down')
     remove_rules()
     for service in SERVICES:
-        Path(f'/etc/systemd/system/{service}.service').unlink(missing_ok=True)
+        Path(runtime_name(f'/etc/systemd/system/{service}.service')).unlink(missing_ok=True)
     for unit in WATCHDOG_UNITS:
-        Path(f'/etc/systemd/system/{unit}').unlink(missing_ok=True)
-    for name in ['/etc/sysctl.d/90-rykvo-sip.conf', '/etc/modules-load.d/rykvo-sip.conf']:
-        Path(name).unlink(missing_ok=True)
+        Path(runtime_name(f'/etc/systemd/system/{unit}')).unlink(missing_ok=True)
+    for name in ['/etc/sysctl.d/90-vowifi-vpn.conf', '/etc/modules-load.d/vowifi-vpn.conf']:
+        Path(runtime_name(name)).unlink(missing_ok=True)
     other_containers = run(['docker', 'ps', '-q']).stdout.strip()
     other_wireguard = run(['wg', 'show', 'interfaces']).stdout.strip()
     if not other_containers and not other_wireguard:
@@ -409,11 +463,12 @@ def uninstall():
             if run(['sysctl', '-n', key]).stdout.strip() == '1':
                 run(['sysctl', '-w', key + '=' + value])
     run(['systemctl', 'daemon-reload'])
-    if ROOT.resolve() != Path('/opt/sip-tunnel') or ROOT.is_symlink():
+    if ROOT.resolve() not in (DEFAULT_ROOT, LEGACY_ROOT) or ROOT.is_symlink():
         raise ValueError('删除路径异常。')
     shutil.rmtree(ROOT)
-    if CLI.is_file() and not CLI.is_symlink() and CLI_MARKER in CLI.read_text():
-        CLI.unlink()
+    for command in (CLI, LEGACY_CLI):
+        if owned_cli(command):
+            command.unlink()
     print('本项目已完整卸载。Docker、Caddy 等共享依赖保留。')
 
 
@@ -424,18 +479,18 @@ def main():
     if command == 'preflight':
         preflight()
     elif command == 'install':
-        was_active = run(['systemctl','is-active','--quiet','sip-simple-panel'],check=False).returncode == 0
+        was_active = run(['systemctl','is-active','--quiet','vowifi-vpn-panel'],check=False).returncode == 0
         try:
             install()
         except (Exception, KeyboardInterrupt):
             backup = ROOT/'backups/app-rollback'
             if SOURCE_REPLACED and backup.exists():
-                run(['systemctl','stop','sip-simple-panel'],check=False)
+                run(['systemctl','stop','vowifi-vpn-panel'],check=False)
                 bounded_remove(ROOT/'app')
                 backup.rename(ROOT/'app')
                 if was_active:
-                    run(['systemctl','start','sip-simple-panel'],check=False)
-            run(['systemctl','start','sip-watchdog.timer'],check=False)
+                    run(['systemctl','start','vowifi-vpn-panel'],check=False)
+            run(['systemctl','start','vowifi-vpn-watchdog.timer'],check=False)
             raise
     elif command in ('rules', 'watchdog'):
         state = read_marker()
