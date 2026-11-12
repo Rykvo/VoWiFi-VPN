@@ -12,23 +12,13 @@ Ubuntu 24.04 LTS · amd64 / arm64
 curl -fsSL https://raw.githubusercontent.com/Rykvo/VoWiFi-VPN/main/deploy.sh | sudo bash -s -- install
 ```
 
-仓库公开后可用。在 SSH 终端执行，按提示填写管理员账号和密码；完成后访问 `https://服务器IP/gly`。
+在 SSH 终端执行，按提示填写管理员账号和密码；完成后访问 `https://服务器IP/gly`。
 
 ## 一键更新
 
 ```bash
 sudo vowifi-vpn update
 ```
-
-从旧版升级，或尚未安装 `vowifi-vpn` 命令时，请执行一次：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Rykvo/VoWiFi-VPN/main/deploy.sh | sudo bash -s -- update
-```
-
-升级后使用 `sudo vowifi-vpn update`。已有的 `rykvo-sip` 命令会作为兼容入口继续可用。账号、密钥、接入码和客户端配置保留。
-
-全新安装使用 `/opt/vowifi-vpn`、`vowifi-vpn-*` 服务和 `vowifi-vpn-wg-easy` 容器。旧版升级会沿用 `/opt/sip-tunnel`、`sip-*` 服务和原容器，避免仅因改名而重建正在使用的隧道；旧版恢复日志仍使用 `journalctl -u sip-watchdog.service` 查看。
 
 ## 一键卸载
 
