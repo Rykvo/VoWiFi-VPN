@@ -402,6 +402,8 @@ def diagnose(panel, client_id=None):
     print('端口映射：' + ('正常' if panel.rules_healthy(records) else '异常'))
     print('入口规则：' + ('正常' if input_rules_healthy() else '异常'))
     if client is None:
+        for row in records['clients']:
+            print(f'客户端 ID {row["id"]}：{row.get("name", "")}（{row["ip"]}）')
         print('检查指定客户端：sudo vowifi-vpn diagnose 客户端ID')
         return
     print(f'客户端：{client["id"]}（{client["ip"]}）')

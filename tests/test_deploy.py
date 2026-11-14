@@ -439,6 +439,7 @@ class DiagnosticTests(unittest.TestCase):
         m.diagnose(self.panel)
         self.assertFalse(any(args[0] == 'ping' for args,_ in self.calls))
         self.assertIn('端口映射：正常',self.output)
+        self.assertTrue(any('客户端 ID 11' in line for line in self.output))
         self.panel.apply_rules.assert_not_called()
 
     def test_client_probe_is_bounded_and_never_changes_rules_or_restarts_services(self):
