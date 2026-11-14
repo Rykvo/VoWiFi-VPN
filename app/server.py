@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import socket
 import subprocess
 import sys
@@ -402,7 +403,7 @@ def validate_client(name, start, end, clients):
 def run(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=25, **kwargs)
 
-def apply_rules(state):
+def firewall_plan(state):
     # Validate persisted data before constructing the restore input.
     seen = []
     for c in state['clients']:
@@ -413,13 +414,7 @@ def apply_rules(state):
         if any(x['ip'] == c['ip'] for x in seen):
             raise UserError('客户端隧道地址重复。')
         seen.append(c)
-    # Loose reverse-path filtering supports the tunnel's source-based routes.
-    if Path('/sys/class/net/wg0').exists():
-        run(['sysctl', '-q', '-w', 'net.ipv4.conf.wg0.rp_filter=2'])
-    for table, chain in [('nat', 'SIPT_DNAT'), ('nat', 'SIPT_SNAT'), ('filter', 'SIPT_FORWARD')]:
-        check = subprocess.run(['iptables','-w','10','-t',table,'-S',chain],capture_output=True)
-        if check.returncode:
-            run(['iptables','-w','10','-t',table,'-N',chain])
+    chains = [('nat', 'SIPT_DNAT'), ('nat', 'SIPT_SNAT'), ('filter', 'SIPT_FORWARD')]
     nat = ['*nat', '-F SIPT_DNAT', '-F SIPT_SNAT']
     forward = ['*filter', '-F SIPT_FORWARD',
         f'-A SIPT_FORWARD -i wg0 -o {PUBLIC_IF} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
@@ -434,15 +429,77 @@ def apply_rules(state):
     forward += ['-A SIPT_FORWARD -i wg0 -j DROP', '-A SIPT_FORWARD -o wg0 -j DROP',
                 '-A SIPT_FORWARD -j RETURN', 'COMMIT']
     payload = '\n'.join(nat + ['COMMIT'] + forward) + '\n'
-    run(['iptables-restore','-w','10','--noflush','--test'],input=payload)
-    run(['iptables-restore','-w','10','--noflush'],input=payload)
     jumps = [('nat','PREROUTING',['-i',PUBLIC_IF,'-d',BIND_IP,'-j','SIPT_DNAT']),
              ('nat','POSTROUTING',['-o',PUBLIC_IF,'-j','SIPT_SNAT']),
              ('filter','FORWARD',['-j','SIPT_FORWARD'])]
+    return chains, payload, jumps
+
+
+def apply_rules(state):
+    chains, payload, jumps = firewall_plan(state)
+    # Loose reverse-path filtering supports the tunnel's source-based routes.
+    if Path('/sys/class/net/wg0').exists():
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.wg0.rp_filter=2'])
+    for table, chain in chains:
+        check = subprocess.run(['iptables','-w','10','-t',table,'-S',chain],capture_output=True)
+        if check.returncode:
+            run(['iptables','-w','10','-t',table,'-N',chain])
+    run(['iptables-restore','-w','10','--noflush','--test'],input=payload)
+    run(['iptables-restore','-w','10','--noflush'],input=payload)
     for table, chain, args in jumps:
         check = subprocess.run(['iptables','-w','10','-t',table,'-C',chain]+args,capture_output=True)
         if check.returncode:
             run(['iptables','-w','10','-t',table,'-I',chain,'1']+args)
+
+
+def rule_tokens(line):
+    tokens = shlex.split(line)
+    normalized = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        # iptables -S adds protocol matches and /32 suffixes automatically.
+        if token == '-m' and index + 1 < len(tokens) and tokens[index + 1] in ('tcp', 'udp'):
+            index += 2
+            continue
+        if token == '--ctstate' and index + 1 < len(tokens):
+            normalized.extend((token, ','.join(sorted(tokens[index + 1].split(',')))))
+            index += 2
+            continue
+        normalized.append(token.removesuffix('/32'))
+        index += 1
+    return tuple(normalized)
+
+
+def rules_healthy(state):
+    chains, payload, jumps = firewall_plan(state)
+    expected = {chain: [] for _, chain in chains}
+    for line in payload.splitlines():
+        if line.startswith('-A '):
+            tokens = rule_tokens(line)
+            expected[tokens[1]].append(tokens)
+    for table in ('nat', 'filter'):
+        try:
+            result = subprocess.run(['iptables', '-w', '2', '-t', table, '-S'],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode:
+                return False
+            actual = [rule_tokens(line) for line in result.stdout.splitlines() if line.strip()]
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        for owner_table, chain in chains:
+            if owner_table != table:
+                continue
+            if ('-N', chain) not in actual:
+                return False
+            # Exact ordered comparisons are restricted to project-owned chains.
+            if [rule for rule in actual if rule[:2] == ('-A', chain)] != expected[chain]:
+                return False
+        for owner_table, chain, args in jumps:
+            if owner_table == table and rule_tokens(shlex.join(['-A', chain] + args)) not in actual:
+                return False
+    return True
+
 
 def commit_state(old, new):
     try:

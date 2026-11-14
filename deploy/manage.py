@@ -44,10 +44,6 @@ SERVICES = ('vowifi-vpn-caddy', 'vowifi-vpn-panel', 'vowifi-vpn-portmap', 'vowif
 WATCHDOG_UNITS = ('vowifi-vpn-watchdog.timer', 'vowifi-vpn-watchdog.service')
 CHAINS = {'nat': ('SIPT_DNAT', 'SIPT_SNAT'), 'filter': ('SIPT_FORWARD', 'SIPT_INPUT')}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-BBR_SYSCTL = Path('/etc/sysctl.d/90-vowifi-vpn-bbr.conf')
-BBR_MODULES = Path('/etc/modules-load.d/vowifi-vpn-bbr.conf')
-BBR_HEADER = '# VoWiFi VPN BBR settings\n'
-BBR_VALUES = {'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr'}
 
 
 def runtime_name(value):
@@ -102,83 +98,6 @@ def write(path, value, mode=0o600):
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
-
-
-def configure_bbr(state):
-    paths = (BBR_SYSCTL, BBR_MODULES)
-    previous_files = {}
-    for path in paths:
-        if path.is_symlink() or (path.exists() and not path.read_text().startswith(BBR_HEADER)):
-            print(f'BBR 已跳过：{path} 已被其他配置占用。')
-            return False
-        previous_files[path] = path.read_text() if path.exists() else None
-    try:
-        # The algorithm may be built into the kernel even if modprobe fails.
-        run(['modprobe', 'tcp_bbr'], check=False, timeout=10)
-        available = run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'], timeout=10).stdout.split()
-        if 'bbr' not in available:
-            print('当前内核不支持 BBR，已跳过；VPN 继续使用原网络配置。')
-            return False
-        run(['modprobe', 'sch_fq'], check=False, timeout=10)
-        before = {key: run(['sysctl', '-n', key], timeout=10).stdout.strip() for key in BBR_VALUES}
-    except (OSError, subprocess.SubprocessError):
-        print('BBR 检测未完成，已跳过；VPN 继续使用原网络配置。')
-        return False
-    previous_state = state.get('bbr')
-    # Save the first baseline before touching live settings, including on updates.
-    state['bbr'] = {'original': previous_state['original'] if previous_state else before,
-                    'enabled': False}
-    write(MARKER, state)
-    try:
-        write(BBR_MODULES, BBR_HEADER + 'tcp_bbr\nsch_fq\n', 0o644)
-        write(BBR_SYSCTL, BBR_HEADER + ''.join(f'{key}={value}\n' for key, value in BBR_VALUES.items()), 0o644)
-        run(['sysctl', '-p', str(BBR_SYSCTL)], timeout=10)
-        if any(run(['sysctl', '-n', key], timeout=10).stdout.strip() != value for key, value in BBR_VALUES.items()):
-            raise RuntimeError('BBR readback mismatch')
-    except (OSError, subprocess.SubprocessError, RuntimeError):
-        # A sysctl file can fail halfway through; undo both keys and both files.
-        restored = True
-        for key, value in before.items():
-            try:
-                if run(['sysctl', '-w', f'{key}={value}'], check=False, timeout=10).returncode:
-                    restored = False
-            except (OSError, subprocess.SubprocessError):
-                restored = False
-        for path, content in previous_files.items():
-            try:
-                if content is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    write(path, content, 0o644)
-            except OSError:
-                restored = False
-        if restored:
-            if previous_state is None:
-                state.pop('bbr', None)
-            else:
-                state['bbr'] = previous_state
-        write(MARKER, state)
-        print('BBR 启用失败，已还原本次修改；VPN 继续使用原网络配置。' if restored
-              else 'BBR 启用失败且还原未完成，已保存原值，请检查 sysctl 配置。')
-        return False
-    state['bbr']['enabled'] = True
-    write(MARKER, state)
-    print('BBR 已启用：TCP 拥塞控制 bbr，默认队列 fq（不替换正在使用的网卡队列）。')
-    return True
-
-
-def restore_bbr(state):
-    record = state.get('bbr')
-    if not record:
-        return
-    for path in (BBR_SYSCTL, BBR_MODULES):
-        if path.is_file() and not path.is_symlink() and path.read_text().startswith(BBR_HEADER):
-            path.unlink()
-    # Respect settings changed by the administrator after this project enabled BBR.
-    for key, applied in BBR_VALUES.items():
-        original = record.get('original', {}).get(key)
-        if original is not None and run(['sysctl', '-n', key], timeout=10).stdout.strip() == applied:
-            run(['sysctl', '-w', f'{key}={original}'], timeout=10)
 
 
 def read_marker():
@@ -313,6 +232,23 @@ def input_rules():
         run(prefix + ['-I', 'INPUT', '1', '-j', 'SIPT_INPUT'])
 
 
+def input_rules_healthy():
+    checks = [
+        ['INPUT', '-j', 'SIPT_INPUT'],
+        ['SIPT_INPUT', '-p', 'tcp', '-m', 'multiport', '--dports', '80,443', '-j', 'ACCEPT'],
+        ['SIPT_INPUT', '-p', 'udp', '-m', 'multiport', '--dports', '51820', '-j', 'ACCEPT'],
+        ['SIPT_INPUT', '-j', 'RETURN'],
+    ]
+    return all(run(['iptables', '-w', '2', '-C'] + rule, check=False, timeout=5).returncode == 0
+               for rule in checks)
+
+
+def forwarding_healthy():
+    return all(run(['sysctl', '-n', key], timeout=5).stdout.strip() == value for key, value in (
+        ('net.ipv4.ip_forward', '1'), ('net.ipv4.conf.all.src_valid_mark', '1'),
+        ('net.ipv4.conf.wg0.rp_filter', '2')))
+
+
 def initialize_wireguard(panel):
     credentials = ROOT / 'admin-credentials.json'
     if not credentials.exists():
@@ -416,10 +352,18 @@ def watchdog(panel):
     with panel.mutation():
         health = json.loads(path.read_text()) if path.exists() else {'failures': 0, 'lastRestart': 0}
         if healthy:
-            # Restore project rules after Docker recreates the interface/container.
-            if health.get('started') != started or health['failures']:
-                panel.apply_rules(panel.load_state())
+            # A firewall reload or sysctl reset can break calls while wg0 stays up.
+            records = panel.load_state()
+            forwarding = forwarding_healthy()
+            if (health.get('started') != started or health['failures'] or not forwarding
+                    or not panel.rules_healthy(records) or not input_rules_healthy()):
+                if not forwarding:
+                    run(['sysctl', '-w', 'net.ipv4.ip_forward=1',
+                         'net.ipv4.conf.all.src_valid_mark=1'], timeout=10)
+                panel.apply_rules(records)
                 input_rules()
+                health['lastRepair'] = now
+                print('已恢复隧道转发配置，未重启 VPN 容器。', flush=True)
             health.update(failures=0, started=started)
         else:
             health['failures'] += 1
@@ -434,6 +378,51 @@ def watchdog(panel):
     if recover:
         print('隧道接口连续异常，正在恢复容器。', flush=True)
         run(['docker', 'restart', 'vowifi-vpn-wg-easy'], timeout=45)
+
+
+def diagnose(panel, client_id=None):
+    """Read-only local checks; optional ICMP probing never restarts a tunnel."""
+    records = panel.load_state()
+    client = None
+    if client_id is not None:
+        if not re.fullmatch(r'[0-9]+', client_id):
+            raise ValueError('客户端 ID 必须为整数。')
+        client = next((row for row in records['clients'] if row['id'] == int(client_id)), None)
+        if client is None:
+            raise ValueError('没有这个客户端。')
+        address = ipaddress.IPv4Address(client['ip'])
+        if address not in ipaddress.ip_network('10.77.0.0/24') or int(str(address).split('.')[-1]) not in range(2, 255):
+            raise ValueError('客户端隧道地址异常。')
+    container = run(['docker', 'inspect', '--format', '{{.State.Status}}', 'vowifi-vpn-wg-easy'], check=False, timeout=5)
+    interface = run(['wg', 'show', 'wg0', 'listen-port'], check=False, timeout=5)
+    ready = interface.returncode == 0 and interface.stdout.strip() == '51820'
+    print('容器：' + (container.stdout.strip() if container.returncode == 0 else '检查失败'))
+    print('WireGuard 接口：' + ('正常' if ready else '异常'))
+    print('转发参数：' + ('正常' if ready and forwarding_healthy() else '异常'))
+    print('端口映射：' + ('正常' if panel.rules_healthy(records) else '异常'))
+    print('入口规则：' + ('正常' if input_rules_healthy() else '异常'))
+    if client is None:
+        print('检查指定客户端：sudo vowifi-vpn diagnose 客户端ID')
+        return
+    print(f'客户端：{client["id"]}（{client["ip"]}）')
+    if not ready:
+        print('接口异常，跳过客户端探测。')
+        return
+    allowed = run(['wg', 'show', 'wg0', 'allowed-ips'], check=False, timeout=5)
+    peer = next((parts[0] for line in allowed.stdout.splitlines()
+                 if len(parts := line.split(maxsplit=1)) == 2 and client['ip'] + '/32' in re.split(r'[,\s]+', parts[1])), None) if allowed.returncode == 0 else None
+    handshakes = run(['wg', 'show', 'wg0', 'latest-handshakes'], check=False, timeout=5)
+    stamp = next((int(parts[1]) for line in handshakes.stdout.splitlines()
+                  if len(parts := line.split()) == 2 and parts[0] == peer and parts[1].isdigit()), 0) if handshakes.returncode == 0 else 0
+    print('最近握手：' + (f'{max(0, int(time.time()) - stamp)} 秒前' if stamp else '无记录'))
+    try:
+        probe = run(['ping', '-n', '-I', 'wg0', '-c', '5', '-W', '1', client['ip']], check=False, timeout=8)
+        print(probe.stdout.strip())
+        if probe.returncode:
+            print('探测未全部成功，也可能客户端屏蔽 ICMP；不能仅凭此判断通话失败。')
+    except (OSError, subprocess.SubprocessError):
+        print('探测无法完成，请检查 ping 工具与本地防火墙。')
+    print('以上仅检查隧道；通话的 RTP 丢包和抖动需要在本地 SIP 软件中查看。')
 
 
 def wait_wireguard():
@@ -504,7 +493,6 @@ def install():
                 raise RuntimeError('服务启动检查未通过，请检查 systemd 日志。')
             time.sleep(2)
     run(['systemctl', 'is-active', *SERVICES], capture=False)
-    configure_bbr(state)
     install_commands()
     print(f'部署完成：https://{settings["panelDomain"] or panel.PUBLIC_IP}/gly')
     print('HTTPS 证书自动申请；请确保云防火墙已开放 TCP 80/443、UDP 51820 和客户端端口段。')
@@ -544,7 +532,6 @@ def uninstall():
         for key, value in state['sysctl'].items():
             if run(['sysctl', '-n', key]).stdout.strip() == '1':
                 run(['sysctl', '-w', key + '=' + value])
-    restore_bbr(state)
     run(['systemctl', 'daemon-reload'])
     if ROOT.resolve() not in (DEFAULT_ROOT, LEGACY_ROOT) or ROOT.is_symlink():
         raise ValueError('删除路径异常。')
@@ -575,10 +562,15 @@ def main():
                     run(['systemctl','start','vowifi-vpn-panel'],check=False)
             run(['systemctl','start','vowifi-vpn-watchdog.timer'],check=False)
             raise
-    elif command in ('rules', 'watchdog'):
+    elif command in ('rules', 'watchdog', 'diagnose'):
         state = read_marker()
         os.environ.update(state['network'], SIP_ROOT=str(ROOT))
         panel = panel_module()
+        if command == 'diagnose':
+            if len(sys.argv) > 3:
+                raise ValueError('用法：vowifi-vpn diagnose [客户端ID]')
+            diagnose(panel, sys.argv[2] if len(sys.argv) == 3 else None)
+            return
         if command == 'watchdog':
             watchdog(panel)
             return

@@ -17,5 +17,7 @@ jobs:
           python3 -B -m unittest discover -s tests -p 'test_deploy.py'
       - name: UI tests
         run: node tests/ui.cjs
+      - name: Firewall recovery in isolated network namespace
+        run: sudo python3 -B tests/test_firewall_integration.py
       - name: Piped deployment prompts and cleanup
         run: sudo python3 -B tests/test_bootstrap.py

@@ -270,7 +270,7 @@ class RebrandingTests(unittest.TestCase):
              patch.object(m, 'CLI', new_cli), patch.object(m, 'LEGACY_CLI', old_cli), \
              patch.object(m, 'write', side_effect=safe_write), patch.object(m, 'run'), \
              patch.object(m, 'compose') as compose, patch.object(m, 'install_source'), \
-             patch.object(m, 'panel_module', return_value=panel), patch.object(m, 'configure_bbr') as bbr, \
+             patch.object(m, 'panel_module', return_value=panel), \
              patch.object(m.OPENER, 'open', return_value=response), patch.dict(m.os.environ, {}, clear=False):
             m.install()
         for name, content in preserved.items():
@@ -281,146 +281,7 @@ class RebrandingTests(unittest.TestCase):
         self.assertIn('/etc/systemd/system/sip-simple-panel.service', written)
         self.assertEqual(new_cli.read_bytes(), old_cli.read_bytes())
         compose.assert_any_call('up', '-d')
-        bbr.assert_called_once()
         self.assertNotIn('INIT_PASSWORD', (self.legacy / 'compose.yaml').read_text())
-
-
-class BBRTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        root = Path(self.temp.name)
-        self.sysctl = root / 'sysctl.d/90-vowifi-vpn-bbr.conf'
-        self.modules = root / 'modules-load.d/vowifi-vpn-bbr.conf'
-        self.marker = root / 'marker.json'
-        self.state = {'project':'VoWiFi-VPN','version':1,'sysctl':{}}
-        self.original = {'net.core.default_qdisc':'fq_codel', 'net.ipv4.tcp_congestion_control':'cubic'}
-        self.live = dict(self.original)
-        self.available = 'reno cubic bbr'
-        self.module_result = 0
-        self.fail_apply = False
-        self.fail_restore = False
-        self.mismatch = False
-        self.applied = False
-        self.calls = []
-        def fake_run(args, **kwargs):
-            self.calls.append(args)
-            output = ''
-            if args[0] == 'modprobe':
-                return subprocess.CompletedProcess(args, self.module_result, '', '')
-            if args[:2] == ['sysctl','-n']:
-                key = args[2]
-                output = self.available if key.endswith('tcp_available_congestion_control') else self.live[key]
-                if self.mismatch and self.applied and key.endswith('tcp_congestion_control'):
-                    output = 'reno'
-            elif args[:2] == ['sysctl','-p']:
-                self.live['net.core.default_qdisc'] = 'fq'
-                if self.fail_apply:
-                    raise subprocess.CalledProcessError(1,args)
-                self.live['net.ipv4.tcp_congestion_control'] = 'bbr'
-                self.applied = True
-            elif args[:2] == ['sysctl','-w']:
-                if self.fail_restore:
-                    return subprocess.CompletedProcess(args,1,'','')
-                key, value = args[2].split('=',1)
-                self.live[key] = value
-            return subprocess.CompletedProcess(args,0,output,'')
-        for item in [patch.object(m,'BBR_SYSCTL',self.sysctl),patch.object(m,'BBR_MODULES',self.modules),
-                     patch.object(m,'MARKER',self.marker),patch.object(m,'run',side_effect=fake_run)]:
-            item.start()
-            self.addCleanup(item.stop)
-
-    def test_enable_persists_bbr_fq_and_original_values(self):
-        self.assertTrue(m.configure_bbr(self.state))
-        self.assertEqual(self.live,m.BBR_VALUES)
-        self.assertEqual(self.state['bbr']['original'],self.original)
-        self.assertTrue(self.state['bbr']['enabled'])
-        self.assertEqual(json.loads(self.marker.read_text())['bbr'],self.state['bbr'])
-        self.assertIn('net.ipv4.tcp_congestion_control=bbr',self.sysctl.read_text())
-        self.assertIn('tcp_bbr\nsch_fq\n',self.modules.read_text())
-        self.assertEqual(self.sysctl.stat().st_mode & 0o777,0o644)
-        self.assertFalse(any(args[0] in ('tc','reboot','systemctl') for args in self.calls))
-
-    def test_unsupported_kernel_does_not_modify_or_persist_settings(self):
-        self.available = 'reno cubic'
-        self.module_result = 1
-        self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.live,self.original)
-        self.assertNotIn('bbr',self.state)
-        self.assertFalse(self.sysctl.exists())
-        self.assertFalse(self.modules.exists())
-        self.assertFalse(any(args[:2] in (['sysctl','-p'],['sysctl','-w']) for args in self.calls))
-
-    def test_builtin_bbr_is_supported_even_when_modprobe_fails(self):
-        self.module_result = 1
-        self.assertTrue(m.configure_bbr(self.state))
-
-    def test_updates_never_overwrite_the_first_baseline(self):
-        self.assertTrue(m.configure_bbr(self.state))
-        self.assertTrue(m.configure_bbr(self.state))
-        self.assertEqual(self.state['bbr']['original'],self.original)
-        m.restore_bbr(self.state)
-        self.assertEqual(self.live,self.original)
-        self.assertFalse(self.sysctl.exists())
-        self.assertFalse(self.modules.exists())
-
-    def test_preexisting_bbr_is_preserved_on_uninstall(self):
-        self.live = dict(m.BBR_VALUES)
-        self.assertTrue(m.configure_bbr(self.state))
-        m.restore_bbr(self.state)
-        self.assertEqual(self.live,m.BBR_VALUES)
-
-    def test_partial_apply_is_fully_rolled_back(self):
-        self.fail_apply = True
-        self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.live,self.original)
-        self.assertNotIn('bbr',self.state)
-        self.assertFalse(self.sysctl.exists())
-        self.assertFalse(self.modules.exists())
-
-    def test_failed_verification_also_rolls_back(self):
-        self.mismatch = True
-        self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.live,self.original)
-        self.assertNotIn('bbr',self.state)
-
-    def test_failed_update_restores_previous_files_and_metadata(self):
-        self.assertTrue(m.configure_bbr(self.state))
-        before = self.sysctl.read_text()
-        self.fail_apply = True
-        self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.live,m.BBR_VALUES)
-        self.assertEqual(self.sysctl.read_text(),before)
-        self.assertTrue(self.state['bbr']['enabled'])
-        self.assertEqual(self.state['bbr']['original'],self.original)
-
-    def test_failed_rollback_keeps_original_values_for_later_recovery(self):
-        self.fail_apply = self.fail_restore = True
-        with patch('builtins.print') as output:
-            self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.state['bbr']['original'],self.original)
-        self.assertFalse(self.state['bbr']['enabled'])
-        self.assertIn('还原未完成',output.call_args.args[0])
-
-    def test_unrelated_configuration_is_never_overwritten(self):
-        self.sysctl.parent.mkdir()
-        self.sysctl.write_text('# administrator settings\n')
-        self.assertFalse(m.configure_bbr(self.state))
-        self.assertEqual(self.sysctl.read_text(),'# administrator settings\n')
-        self.assertFalse(self.calls)
-
-    def test_uninstall_respects_later_administrator_changes(self):
-        self.assertTrue(m.configure_bbr(self.state))
-        self.live['net.ipv4.tcp_congestion_control'] = 'reno'
-        m.restore_bbr(self.state)
-        self.assertEqual(self.live['net.ipv4.tcp_congestion_control'],'reno')
-        self.assertEqual(self.live['net.core.default_qdisc'],self.original['net.core.default_qdisc'])
-
-    def test_uninstall_never_deletes_replaced_config_files(self):
-        self.assertTrue(m.configure_bbr(self.state))
-        self.sysctl.write_text('# administrator replacement\n')
-        m.restore_bbr(self.state)
-        self.assertEqual(self.sysctl.read_text(),'# administrator replacement\n')
 
 
 class RecoveryTests(unittest.TestCase):
@@ -441,7 +302,9 @@ class RecoveryTests(unittest.TestCase):
                 return Mock(returncode=0 if self.healthy else 1, stdout='51820\n' if self.healthy else '')
             return Mock(returncode=0, stdout='')
         for item in [patch.object(m, 'ROOT', self.root), patch.object(m, 'run', side_effect=fake_run),
-                     patch.object(m, 'input_rules'), patch.object(m.time, 'time', return_value=1000)]:
+                     patch.object(m, 'input_rules'), patch.object(m, 'input_rules_healthy', return_value=True),
+                     patch.object(m, 'forwarding_healthy', return_value=True),
+                     patch.object(m.time, 'time', return_value=1000)]:
             item.start()
             self.addCleanup(item.stop)
 
@@ -496,6 +359,39 @@ class RecoveryTests(unittest.TestCase):
                 m.watchdog(self.panel)
         self.assertEqual(run.call_count, 1)
 
+    def test_firewall_reload_is_repaired_without_container_restart(self):
+        m.watchdog(self.panel)
+        self.panel.rules_healthy.return_value = False
+        m.watchdog(self.panel)
+        self.assertEqual(self.panel.apply_rules.call_count, 2)
+        self.assertFalse(self.restarted())
+
+    def test_lost_input_rules_are_repaired_without_container_restart(self):
+        m.watchdog(self.panel)
+        with patch.object(m, 'input_rules_healthy', return_value=False):
+            m.watchdog(self.panel)
+        self.assertEqual(self.panel.apply_rules.call_count, 2)
+        self.assertFalse(self.restarted())
+
+    def test_reset_forwarding_is_repaired_without_container_restart(self):
+        m.watchdog(self.panel)
+        with patch.object(m, 'forwarding_healthy', return_value=False):
+            m.watchdog(self.panel)
+        self.assertIn(['sysctl','-w','net.ipv4.ip_forward=1','net.ipv4.conf.all.src_valid_mark=1'], self.commands)
+        self.assertEqual(self.panel.apply_rules.call_count, 2)
+        self.assertFalse(self.restarted())
+
+    def test_unhealthy_network_does_not_restart_for_a_rule_restore_failure(self):
+        m.watchdog(self.panel)
+        self.panel.rules_healthy.return_value = False
+        self.panel.apply_rules.side_effect = RuntimeError('fixture restore failure')
+        with self.assertRaises(RuntimeError):
+            m.watchdog(self.panel)
+        self.assertFalse(self.restarted())
+        self.panel.apply_rules.side_effect = None
+        m.watchdog(self.panel)
+        self.assertEqual(self.panel.apply_rules.call_count, 3)
+
     def test_rules_wait_for_the_interface_to_be_ready(self):
         with patch.object(m, 'run', side_effect=[Mock(returncode=1), Mock(returncode=0, stdout='51820\n')]), patch.object(m.time, 'sleep') as sleep:
             m.wait_wireguard()
@@ -506,6 +402,79 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 m.wait_wireguard()
         self.assertEqual(sleep.call_count, 30)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.panel = Mock()
+        self.panel.load_state.return_value = {'clients':[{'id':11,'ip':'10.77.0.11'}]}
+        self.panel.rules_healthy.return_value = True
+        self.calls = []
+        self.output = []
+        self.interface_ready = True
+        self.probe_status = 0
+        def fake_run(args, **kwargs):
+            self.calls.append((args,kwargs))
+            result = subprocess.CompletedProcess(args,0,'','')
+            if args[:2] == ['docker','inspect']:
+                result.stdout = 'running\n'
+            elif args[-1] == 'listen-port':
+                result.stdout = '51820\n' if self.interface_ready else ''
+                result.returncode = 0 if self.interface_ready else 1
+            elif args[-1] == 'allowed-ips':
+                result.stdout = 'fixture-public-key\t10.77.0.11/32, fd77:77:77::b/128\n'
+            elif args[-1] == 'latest-handshakes':
+                result.stdout = 'fixture-public-key\t980\n'
+            elif args[0] == 'ping':
+                result.stdout = '5 packets transmitted, 5 received, 0% packet loss\n'
+                result.returncode = self.probe_status
+            return result
+        for item in [patch.object(m,'run',side_effect=fake_run),patch.object(m,'forwarding_healthy',return_value=True),
+                     patch.object(m,'input_rules_healthy',return_value=True),patch.object(m.time,'time',return_value=1000),
+                     patch('builtins.print',side_effect=lambda *values,**kw: self.output.append(' '.join(map(str,values))))]:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_overview_only_checks_local_infrastructure(self):
+        m.diagnose(self.panel)
+        self.assertFalse(any(args[0] == 'ping' for args,_ in self.calls))
+        self.assertIn('端口映射：正常',self.output)
+        self.panel.apply_rules.assert_not_called()
+
+    def test_client_probe_is_bounded_and_never_changes_rules_or_restarts_services(self):
+        m.diagnose(self.panel,'11')
+        self.assertIn('最近握手：20 秒前',self.output)
+        self.assertTrue(any('0% packet loss' in line for line in self.output))
+        self.assertFalse(any('fixture-public-key' in line for line in self.output))
+        self.assertIn(['ping','-n','-I','wg0','-c','5','-W','1','10.77.0.11'],[args for args,_ in self.calls])
+        self.assertTrue(all(kw['timeout'] <= 8 for _,kw in self.calls))
+        self.assertFalse(any(args[0] in ('systemctl','iptables','sysctl') for args,_ in self.calls))
+
+    def test_no_handshake_is_reported_without_restart(self):
+        self.panel.load_state.return_value['clients'][0]['ip'] = '10.77.0.12'
+        m.diagnose(self.panel,'11')
+        self.assertIn('最近握手：无记录',self.output)
+        self.assertFalse(any('restart' in args for args,_ in self.calls))
+
+    def test_nonresponsive_client_is_not_treated_as_a_cloud_failure(self):
+        self.probe_status = 1
+        m.diagnose(self.panel,'11')
+        self.assertTrue(any('不能仅凭此判断通话失败' in line for line in self.output))
+        self.assertFalse(any('restart' in args for args,_ in self.calls))
+
+    def test_missing_interface_skips_client_probe(self):
+        self.interface_ready = False
+        m.diagnose(self.panel,'11')
+        self.assertFalse(any(args[0] == 'ping' for args,_ in self.calls))
+
+    def test_invalid_or_unknown_clients_stop_before_any_command(self):
+        for value in ('x','11; reboot','99'):
+            with self.assertRaises(ValueError):
+                m.diagnose(self.panel,value)
+        self.panel.load_state.return_value['clients'][0]['ip'] = '8.8.8.8'
+        with self.assertRaises(ValueError):
+            m.diagnose(self.panel,'11')
+        self.assertFalse(self.calls)
 
 
 if __name__ == '__main__':

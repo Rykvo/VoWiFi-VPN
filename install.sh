@@ -18,7 +18,7 @@ if [[ -f /opt/sip-tunnel/.rykvo-managed.json ]]; then
   dependency_prefix=rykvo
 fi
 apt-get update
-apt-get install -y ca-certificates curl gnupg iproute2 iptables kmod python3 wireguard-tools
+apt-get install -y ca-certificates curl gnupg iproute2 iptables iputils-ping kmod python3 wireguard-tools
 if ! command -v docker >/dev/null; then
   install -d -m 0755 /etc/apt/keyrings
   curl -fsSL --retry 3 https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc

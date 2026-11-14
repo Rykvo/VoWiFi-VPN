@@ -4,17 +4,9 @@ Ubuntu 24.04 LTS · amd64 / arm64
 
 隧道使用 25 秒保活与 MTU 1380。云端每 30 秒检查容器和 WireGuard 接口；连续 3 次异常后恢复容器，两次恢复至少间隔 5 分钟。客户端离线不会触发云端重启。普通页面更新不再主动重启正常运行的 VPN 容器。
 
+同时检查 IP 转发、隧道回程校验、端口映射和本项目入口规则。防火墙重载或转发参数被重置后，自动修复本项目配置，无需重启正常运行的 VPN 容器；正常规则不反复重写。
+
 这能改善服务故障后的恢复，公网线路丢包、运营商限制和本地设备休眠仍会影响连接；本地客户端需启用 WireGuard 开机启动。云端恢复记录可用 `journalctl -u vowifi-vpn-watchdog.service` 查看。
-
-部署或更新时自动检测系统内核的 BBR 支持，支持时启用 `bbr` TCP 拥塞控制与 `fq` 默认队列，并保存重启后使用的配置。无需更换内核、重启服务器或重建 VPN；现有网卡队列保持原状。不支持时跳过，启用失败会还原本次修改。
-
-BBR 作用于云服务器自身发送的 TCP 数据，不直接加速 WireGuard / SIP / RTP 的 UDP 流量，也不改变仅经云端转发的 TCP 连接的拥塞控制。卸载时清理本项目的 BBR 配置，并在对应参数仍为本项目设置值时还原启用前的值。
-
-查看当前配置：
-
-```bash
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
-```
 
 ## 一键部署
 
@@ -29,6 +21,17 @@ curl -fsSL https://raw.githubusercontent.com/Rykvo/VoWiFi-VPN/main/deploy.sh | s
 ```bash
 sudo vowifi-vpn update
 ```
+
+## 连接诊断
+
+```bash
+sudo vowifi-vpn diagnose
+sudo vowifi-vpn diagnose 11
+```
+
+第一条检查云端容器、隧道接口、转发参数和规则；第二条检查指定客户端（示例 ID 为 11），显示最近握手，并进行 5 次隧道内 ICMP 探测，输出丢包和往返时间。诊断不会重启服务或修改规则，也不会因为客户端不响应而重启整个 VPN。客户端可能屏蔽 ICMP，探测结果不能代替实际 RTP 通话质量数据。
+
+本地设备休眠或切换网络后的恢复、SIP 注册保活和语音抖动缓冲，需要在本地程序中配置。公网持续丢包需要排查线路；云端不会擅自修改网卡队列或按未知带宽限速。
 
 ## 一键卸载
 

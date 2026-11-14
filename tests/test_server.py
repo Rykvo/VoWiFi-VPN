@@ -192,6 +192,64 @@ class NetworkTests(unittest.TestCase):
   commands=[call.args[0] for call in run.call_args_list]
   self.assertTrue(any('-d' in args and '10.0.0.5' in args and 'PREROUTING' in args for args in commands))
 
+class FirewallHealthTests(unittest.TestCase):
+ def setUp(self):
+  self.state={'clients':[{'name':'test','ip':'10.77.0.2','start':20000,'end':20999}]}
+  self.tables={
+   'nat':'''-P PREROUTING ACCEPT
+-N SIPT_DNAT
+-N SIPT_SNAT
+-A PREROUTING -i ens3 -d 10.0.0.5/32 -j SIPT_DNAT
+-A POSTROUTING -o ens3 -j SIPT_SNAT
+-A SIPT_DNAT -p tcp -m tcp --dport 20000:20999 -j DNAT --to-destination 10.77.0.2
+-A SIPT_DNAT -p udp -m udp --dport 20000:20999 -j DNAT --to-destination 10.77.0.2
+-A SIPT_SNAT -s 10.77.0.2/32 -j SNAT --to-source 10.0.0.5
+''',
+   'filter':'''-P FORWARD DROP
+-N SIPT_FORWARD
+-A FORWARD -j SIPT_FORWARD
+-A FORWARD -j OTHER_FIREWALL
+-A SIPT_FORWARD -i wg0 -o ens3 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A SIPT_FORWARD -i ens3 -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A SIPT_FORWARD -i ens3 -o wg0 -d 10.77.0.2/32 -p tcp -m tcp --dport 20000:20999 -j ACCEPT
+-A SIPT_FORWARD -i wg0 -o ens3 -s 10.77.0.2/32 -p tcp -m tcp --sport 20000:20999 -j ACCEPT
+-A SIPT_FORWARD -i ens3 -o wg0 -d 10.77.0.2/32 -p udp -m udp --dport 20000:20999 -j ACCEPT
+-A SIPT_FORWARD -i wg0 -o ens3 -s 10.77.0.2/32 -p udp -m udp --sport 20000:20999 -j ACCEPT
+-A SIPT_FORWARD -i wg0 -j DROP
+-A SIPT_FORWARD -o wg0 -j DROP
+-A SIPT_FORWARD -j RETURN
+'''}
+  import subprocess
+  def fake_run(args,**kwargs):
+   return subprocess.CompletedProcess(args,0,self.tables[args[args.index('-t')+1]],'')
+  for item in [patch.object(m,'PUBLIC_IF','ens3'),patch.object(m,'BIND_IP','10.0.0.5'),patch.object(m.subprocess,'run',side_effect=fake_run)]:
+   item.start();self.addCleanup(item.stop)
+ def test_equivalent_kernel_format_and_other_firewalls_are_accepted(self):
+  self.assertTrue(m.rules_healthy(self.state))
+ def test_deleted_chain_or_jump_is_detected(self):
+  for line in ['-N SIPT_DNAT','-A PREROUTING -i ens3 -d 10.0.0.5/32 -j SIPT_DNAT']:
+   original=self.tables['nat'];self.tables['nat']=original.replace(line+'\n','')
+   self.assertFalse(m.rules_healthy(self.state));self.tables['nat']=original
+ def test_flushed_or_incomplete_port_mapping_is_detected(self):
+  self.tables['nat']='\n'.join(line for line in self.tables['nat'].splitlines() if not ('-A SIPT_DNAT' in line and '-p udp' in line))
+  self.assertFalse(m.rules_healthy(self.state))
+ def test_changed_client_port_ranges_are_detected(self):
+  self.state['clients'][0]['end']=21999
+  self.assertFalse(m.rules_healthy(self.state))
+ def test_extra_rule_in_project_chain_is_detected(self):
+  self.tables['filter']+='-A SIPT_FORWARD -j ACCEPT\n'
+  self.assertFalse(m.rules_healthy(self.state))
+ def test_reordered_project_rules_are_detected(self):
+  self.tables['filter']=self.tables['filter'].replace('-A SIPT_FORWARD -i wg0 -j DROP\n','')+'-A SIPT_FORWARD -i wg0 -j DROP\n'
+  self.assertFalse(m.rules_healthy(self.state))
+ def test_failed_or_timed_out_inspection_is_unhealthy(self):
+  import subprocess
+  from unittest.mock import Mock
+  with patch.object(m.subprocess,'run',return_value=Mock(returncode=1)):
+   self.assertFalse(m.rules_healthy(self.state))
+  with patch.object(m.subprocess,'run',side_effect=subprocess.TimeoutExpired('iptables',5)):
+   self.assertFalse(m.rules_healthy(self.state))
+
 class NotFoundTests(unittest.TestCase):
  def test_no_custom_error_page_remains(self):
   self.assertFalse((m.WEB/'404.html').exists())

@@ -13,12 +13,13 @@ main() {
   local action=${1:-install}
   case "$action" in
     install|update|uninstall) [[ $# -le 1 ]] || { echo '参数错误。'; return 1; } ;;
-    --help|-h) echo 'sudo vowifi-vpn {install|update|uninstall}'; return ;;
-    *) echo '支持 install、update、uninstall。'; return 1 ;;
+    diagnose) [[ $# -le 2 && ( $# -eq 1 || $2 =~ ^[0-9]+$ ) ]] || { echo '用法：vowifi-vpn diagnose [客户端ID]'; return 1; } ;;
+    --help|-h) echo 'sudo vowifi-vpn {install|update|uninstall|diagnose [客户端ID]}'; return ;;
+    *) echo '支持 install、update、uninstall、diagnose。'; return 1 ;;
   esac
   [[ $EUID == 0 ]] || { echo '请使用 sudo 执行。'; return 1; }
   # Read prompts from SSH's terminal, never from the downloaded script stream.
-  if ! ( : </dev/tty ) 2>/dev/null; then
+  if [[ $action != diagnose ]] && ! ( : </dev/tty ) 2>/dev/null; then
     echo '请在交互式 SSH 终端执行；远程命令请使用 ssh -t。'
     return 1
   fi
@@ -31,11 +32,15 @@ main() {
     [[ -z $installed_root ]] || { echo '发现两套安装，请先核对实例。'; return 1; }
     installed_root=/opt/sip-tunnel
   fi
-  if [[ $action == uninstall ]]; then
+  if [[ $action == uninstall || $action == diagnose ]]; then
     [[ -n $installed_root && -f $installed_root/manager.py ]] || {
       echo '未发现此安装器管理的实例。'; return 1;
     }
-    python3 -B "$installed_root/manager.py" uninstall </dev/tty
+    if [[ $action == diagnose ]]; then
+      python3 -B "$installed_root/manager.py" "$@"
+    else
+      python3 -B "$installed_root/manager.py" uninstall </dev/tty
+    fi
     return
   fi
   if [[ $action == update && -z $installed_root ]]; then

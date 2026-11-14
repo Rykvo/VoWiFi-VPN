@@ -26,6 +26,23 @@ class BootstrapTests(unittest.TestCase):
         result = subprocess.run(['bash', str(SCRIPT), 'unknown'], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
+    @unittest.skipUnless(os.geteuid() == 0, 'Run with sudo to test the root-only command.')
+    def test_diagnosis_uses_installed_manager_without_terminal_or_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed = root / 'installed'
+            installed.mkdir()
+            (installed / '.vowifi-managed.json').write_text('{}')
+            (installed / 'manager.py').write_text('import sys\nprint("ARGS:" + ",".join(sys.argv[1:]))\n')
+            script = root / 'deploy.sh'
+            script.write_text(SCRIPT.read_text().replace('/opt/vowifi-vpn',str(installed)).replace('/opt/sip-tunnel',str(root/'legacy')))
+            result = subprocess.run(['bash',str(script),'diagnose','11'],capture_output=True,text=True,start_new_session=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('ARGS:diagnose,11',result.stdout)
+            invalid = subprocess.run(['bash',str(script),'diagnose','11; reboot'],capture_output=True,text=True,timeout=5)
+            self.assertNotEqual(invalid.returncode,0)
+            self.assertNotIn('ARGS:',invalid.stdout)
+
     @unittest.skipUnless(os.geteuid() == 0, 'Run with sudo to test the root-only bootstrap.')
     def test_pipe_keeps_interactive_prompts_and_cleans_download(self):
         self.run_fixture(0)
