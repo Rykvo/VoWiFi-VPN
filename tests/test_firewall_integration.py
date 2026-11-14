@@ -16,7 +16,10 @@ def inside_namespace():
     subprocess.run(['ip', 'link', 'add', 'wg0', 'type', 'dummy'], check=True)
     state = {'clients': [{'name': 'fixture', 'ip': '10.77.0.2', 'start': 20000, 'end': 20999}]}
     panel.apply_rules(state)
-    assert panel.rules_healthy(state), 'Fresh rules must match real kernel output'
+    if not panel.rules_healthy(state):
+        for table in ('nat', 'filter'):
+            print(subprocess.run(['iptables', '-t', table, '-S'], capture_output=True, text=True, check=True).stdout)
+        raise AssertionError('Fresh rules must match real kernel output')
     # Simulate a firewall reload that flushes rules while the interface stays up.
     subprocess.run(['iptables', '-t', 'nat', '-F', 'SIPT_DNAT'], check=True)
     assert not panel.rules_healthy(state), 'Missing port mappings must be detected'

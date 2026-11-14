@@ -468,6 +468,13 @@ def rule_tokens(line):
             continue
         normalized.append(token.removesuffix('/32'))
         index += 1
+    # Kernel output moves -s/-d before interface matches; option order is not
+    # significant, but the order of rules within each chain must stay intact.
+    if normalized[:1] == ['-A']:
+        options = normalized[2:]
+        if len(options) % 2 == 0 and all(value.startswith('-') for value in options[::2]):
+            pairs = sorted(zip(options[::2], options[1::2]))
+            return tuple(normalized[:2] + [value for pair in pairs for value in pair])
     return tuple(normalized)
 
 

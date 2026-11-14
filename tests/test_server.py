@@ -226,6 +226,10 @@ class FirewallHealthTests(unittest.TestCase):
    item.start();self.addCleanup(item.stop)
  def test_equivalent_kernel_format_and_other_firewalls_are_accepted(self):
   self.assertTrue(m.rules_healthy(self.state))
+ def test_kernel_option_reordering_does_not_trigger_repairs(self):
+  self.tables['filter']=self.tables['filter'].replace('-i ens3 -o wg0 -d 10.77.0.2/32','-d 10.77.0.2/32 -i ens3 -o wg0')
+  self.tables['filter']=self.tables['filter'].replace('-i wg0 -o ens3 -s 10.77.0.2/32','-s 10.77.0.2/32 -i wg0 -o ens3')
+  self.assertTrue(m.rules_healthy(self.state))
  def test_deleted_chain_or_jump_is_detected(self):
   for line in ['-N SIPT_DNAT','-A PREROUTING -i ens3 -d 10.0.0.5/32 -j SIPT_DNAT']:
    original=self.tables['nat'];self.tables['nat']=original.replace(line+'\n','')
