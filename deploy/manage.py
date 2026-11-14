@@ -44,6 +44,10 @@ SERVICES = ('vowifi-vpn-caddy', 'vowifi-vpn-panel', 'vowifi-vpn-portmap', 'vowif
 WATCHDOG_UNITS = ('vowifi-vpn-watchdog.timer', 'vowifi-vpn-watchdog.service')
 CHAINS = {'nat': ('SIPT_DNAT', 'SIPT_SNAT'), 'filter': ('SIPT_FORWARD', 'SIPT_INPUT')}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+BBR_SYSCTL = Path('/etc/sysctl.d/90-vowifi-vpn-bbr.conf')
+BBR_MODULES = Path('/etc/modules-load.d/vowifi-vpn-bbr.conf')
+BBR_HEADER = '# VoWiFi VPN BBR settings\n'
+BBR_VALUES = {'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr'}
 
 
 def runtime_name(value):
@@ -98,6 +102,83 @@ def write(path, value, mode=0o600):
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+
+def configure_bbr(state):
+    paths = (BBR_SYSCTL, BBR_MODULES)
+    previous_files = {}
+    for path in paths:
+        if path.is_symlink() or (path.exists() and not path.read_text().startswith(BBR_HEADER)):
+            print(f'BBR 已跳过：{path} 已被其他配置占用。')
+            return False
+        previous_files[path] = path.read_text() if path.exists() else None
+    try:
+        # The algorithm may be built into the kernel even if modprobe fails.
+        run(['modprobe', 'tcp_bbr'], check=False, timeout=10)
+        available = run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'], timeout=10).stdout.split()
+        if 'bbr' not in available:
+            print('当前内核不支持 BBR，已跳过；VPN 继续使用原网络配置。')
+            return False
+        run(['modprobe', 'sch_fq'], check=False, timeout=10)
+        before = {key: run(['sysctl', '-n', key], timeout=10).stdout.strip() for key in BBR_VALUES}
+    except (OSError, subprocess.SubprocessError):
+        print('BBR 检测未完成，已跳过；VPN 继续使用原网络配置。')
+        return False
+    previous_state = state.get('bbr')
+    # Save the first baseline before touching live settings, including on updates.
+    state['bbr'] = {'original': previous_state['original'] if previous_state else before,
+                    'enabled': False}
+    write(MARKER, state)
+    try:
+        write(BBR_MODULES, BBR_HEADER + 'tcp_bbr\nsch_fq\n', 0o644)
+        write(BBR_SYSCTL, BBR_HEADER + ''.join(f'{key}={value}\n' for key, value in BBR_VALUES.items()), 0o644)
+        run(['sysctl', '-p', str(BBR_SYSCTL)], timeout=10)
+        if any(run(['sysctl', '-n', key], timeout=10).stdout.strip() != value for key, value in BBR_VALUES.items()):
+            raise RuntimeError('BBR readback mismatch')
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        # A sysctl file can fail halfway through; undo both keys and both files.
+        restored = True
+        for key, value in before.items():
+            try:
+                if run(['sysctl', '-w', f'{key}={value}'], check=False, timeout=10).returncode:
+                    restored = False
+            except (OSError, subprocess.SubprocessError):
+                restored = False
+        for path, content in previous_files.items():
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    write(path, content, 0o644)
+            except OSError:
+                restored = False
+        if restored:
+            if previous_state is None:
+                state.pop('bbr', None)
+            else:
+                state['bbr'] = previous_state
+        write(MARKER, state)
+        print('BBR 启用失败，已还原本次修改；VPN 继续使用原网络配置。' if restored
+              else 'BBR 启用失败且还原未完成，已保存原值，请检查 sysctl 配置。')
+        return False
+    state['bbr']['enabled'] = True
+    write(MARKER, state)
+    print('BBR 已启用：TCP 拥塞控制 bbr，默认队列 fq（不替换正在使用的网卡队列）。')
+    return True
+
+
+def restore_bbr(state):
+    record = state.get('bbr')
+    if not record:
+        return
+    for path in (BBR_SYSCTL, BBR_MODULES):
+        if path.is_file() and not path.is_symlink() and path.read_text().startswith(BBR_HEADER):
+            path.unlink()
+    # Respect settings changed by the administrator after this project enabled BBR.
+    for key, applied in BBR_VALUES.items():
+        original = record.get('original', {}).get(key)
+        if original is not None and run(['sysctl', '-n', key], timeout=10).stdout.strip() == applied:
+            run(['sysctl', '-w', f'{key}={original}'], timeout=10)
 
 
 def read_marker():
@@ -423,6 +504,7 @@ def install():
                 raise RuntimeError('服务启动检查未通过，请检查 systemd 日志。')
             time.sleep(2)
     run(['systemctl', 'is-active', *SERVICES], capture=False)
+    configure_bbr(state)
     install_commands()
     print(f'部署完成：https://{settings["panelDomain"] or panel.PUBLIC_IP}/gly')
     print('HTTPS 证书自动申请；请确保云防火墙已开放 TCP 80/443、UDP 51820 和客户端端口段。')
@@ -462,6 +544,7 @@ def uninstall():
         for key, value in state['sysctl'].items():
             if run(['sysctl', '-n', key]).stdout.strip() == '1':
                 run(['sysctl', '-w', key + '=' + value])
+    restore_bbr(state)
     run(['systemctl', 'daemon-reload'])
     if ROOT.resolve() not in (DEFAULT_ROOT, LEGACY_ROOT) or ROOT.is_symlink():
         raise ValueError('删除路径异常。')

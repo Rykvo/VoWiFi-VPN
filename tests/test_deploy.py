@@ -270,7 +270,7 @@ class RebrandingTests(unittest.TestCase):
              patch.object(m, 'CLI', new_cli), patch.object(m, 'LEGACY_CLI', old_cli), \
              patch.object(m, 'write', side_effect=safe_write), patch.object(m, 'run'), \
              patch.object(m, 'compose') as compose, patch.object(m, 'install_source'), \
-             patch.object(m, 'panel_module', return_value=panel), \
+             patch.object(m, 'panel_module', return_value=panel), patch.object(m, 'configure_bbr') as bbr, \
              patch.object(m.OPENER, 'open', return_value=response), patch.dict(m.os.environ, {}, clear=False):
             m.install()
         for name, content in preserved.items():
@@ -281,7 +281,146 @@ class RebrandingTests(unittest.TestCase):
         self.assertIn('/etc/systemd/system/sip-simple-panel.service', written)
         self.assertEqual(new_cli.read_bytes(), old_cli.read_bytes())
         compose.assert_any_call('up', '-d')
+        bbr.assert_called_once()
         self.assertNotIn('INIT_PASSWORD', (self.legacy / 'compose.yaml').read_text())
+
+
+class BBRTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.sysctl = root / 'sysctl.d/90-vowifi-vpn-bbr.conf'
+        self.modules = root / 'modules-load.d/vowifi-vpn-bbr.conf'
+        self.marker = root / 'marker.json'
+        self.state = {'project':'VoWiFi-VPN','version':1,'sysctl':{}}
+        self.original = {'net.core.default_qdisc':'fq_codel', 'net.ipv4.tcp_congestion_control':'cubic'}
+        self.live = dict(self.original)
+        self.available = 'reno cubic bbr'
+        self.module_result = 0
+        self.fail_apply = False
+        self.fail_restore = False
+        self.mismatch = False
+        self.applied = False
+        self.calls = []
+        def fake_run(args, **kwargs):
+            self.calls.append(args)
+            output = ''
+            if args[0] == 'modprobe':
+                return subprocess.CompletedProcess(args, self.module_result, '', '')
+            if args[:2] == ['sysctl','-n']:
+                key = args[2]
+                output = self.available if key.endswith('tcp_available_congestion_control') else self.live[key]
+                if self.mismatch and self.applied and key.endswith('tcp_congestion_control'):
+                    output = 'reno'
+            elif args[:2] == ['sysctl','-p']:
+                self.live['net.core.default_qdisc'] = 'fq'
+                if self.fail_apply:
+                    raise subprocess.CalledProcessError(1,args)
+                self.live['net.ipv4.tcp_congestion_control'] = 'bbr'
+                self.applied = True
+            elif args[:2] == ['sysctl','-w']:
+                if self.fail_restore:
+                    return subprocess.CompletedProcess(args,1,'','')
+                key, value = args[2].split('=',1)
+                self.live[key] = value
+            return subprocess.CompletedProcess(args,0,output,'')
+        for item in [patch.object(m,'BBR_SYSCTL',self.sysctl),patch.object(m,'BBR_MODULES',self.modules),
+                     patch.object(m,'MARKER',self.marker),patch.object(m,'run',side_effect=fake_run)]:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_enable_persists_bbr_fq_and_original_values(self):
+        self.assertTrue(m.configure_bbr(self.state))
+        self.assertEqual(self.live,m.BBR_VALUES)
+        self.assertEqual(self.state['bbr']['original'],self.original)
+        self.assertTrue(self.state['bbr']['enabled'])
+        self.assertEqual(json.loads(self.marker.read_text())['bbr'],self.state['bbr'])
+        self.assertIn('net.ipv4.tcp_congestion_control=bbr',self.sysctl.read_text())
+        self.assertIn('tcp_bbr\nsch_fq\n',self.modules.read_text())
+        self.assertEqual(self.sysctl.stat().st_mode & 0o777,0o644)
+        self.assertFalse(any(args[0] in ('tc','reboot','systemctl') for args in self.calls))
+
+    def test_unsupported_kernel_does_not_modify_or_persist_settings(self):
+        self.available = 'reno cubic'
+        self.module_result = 1
+        self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.live,self.original)
+        self.assertNotIn('bbr',self.state)
+        self.assertFalse(self.sysctl.exists())
+        self.assertFalse(self.modules.exists())
+        self.assertFalse(any(args[:2] in (['sysctl','-p'],['sysctl','-w']) for args in self.calls))
+
+    def test_builtin_bbr_is_supported_even_when_modprobe_fails(self):
+        self.module_result = 1
+        self.assertTrue(m.configure_bbr(self.state))
+
+    def test_updates_never_overwrite_the_first_baseline(self):
+        self.assertTrue(m.configure_bbr(self.state))
+        self.assertTrue(m.configure_bbr(self.state))
+        self.assertEqual(self.state['bbr']['original'],self.original)
+        m.restore_bbr(self.state)
+        self.assertEqual(self.live,self.original)
+        self.assertFalse(self.sysctl.exists())
+        self.assertFalse(self.modules.exists())
+
+    def test_preexisting_bbr_is_preserved_on_uninstall(self):
+        self.live = dict(m.BBR_VALUES)
+        self.assertTrue(m.configure_bbr(self.state))
+        m.restore_bbr(self.state)
+        self.assertEqual(self.live,m.BBR_VALUES)
+
+    def test_partial_apply_is_fully_rolled_back(self):
+        self.fail_apply = True
+        self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.live,self.original)
+        self.assertNotIn('bbr',self.state)
+        self.assertFalse(self.sysctl.exists())
+        self.assertFalse(self.modules.exists())
+
+    def test_failed_verification_also_rolls_back(self):
+        self.mismatch = True
+        self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.live,self.original)
+        self.assertNotIn('bbr',self.state)
+
+    def test_failed_update_restores_previous_files_and_metadata(self):
+        self.assertTrue(m.configure_bbr(self.state))
+        before = self.sysctl.read_text()
+        self.fail_apply = True
+        self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.live,m.BBR_VALUES)
+        self.assertEqual(self.sysctl.read_text(),before)
+        self.assertTrue(self.state['bbr']['enabled'])
+        self.assertEqual(self.state['bbr']['original'],self.original)
+
+    def test_failed_rollback_keeps_original_values_for_later_recovery(self):
+        self.fail_apply = self.fail_restore = True
+        with patch('builtins.print') as output:
+            self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.state['bbr']['original'],self.original)
+        self.assertFalse(self.state['bbr']['enabled'])
+        self.assertIn('还原未完成',output.call_args.args[0])
+
+    def test_unrelated_configuration_is_never_overwritten(self):
+        self.sysctl.parent.mkdir()
+        self.sysctl.write_text('# administrator settings\n')
+        self.assertFalse(m.configure_bbr(self.state))
+        self.assertEqual(self.sysctl.read_text(),'# administrator settings\n')
+        self.assertFalse(self.calls)
+
+    def test_uninstall_respects_later_administrator_changes(self):
+        self.assertTrue(m.configure_bbr(self.state))
+        self.live['net.ipv4.tcp_congestion_control'] = 'reno'
+        m.restore_bbr(self.state)
+        self.assertEqual(self.live['net.ipv4.tcp_congestion_control'],'reno')
+        self.assertEqual(self.live['net.core.default_qdisc'],self.original['net.core.default_qdisc'])
+
+    def test_uninstall_never_deletes_replaced_config_files(self):
+        self.assertTrue(m.configure_bbr(self.state))
+        self.sysctl.write_text('# administrator replacement\n')
+        m.restore_bbr(self.state)
+        self.assertEqual(self.sysctl.read_text(),'# administrator replacement\n')
 
 
 class RecoveryTests(unittest.TestCase):
